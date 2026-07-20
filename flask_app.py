@@ -258,6 +258,13 @@ GAME_DAYS = {
 # =============================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =============================================
+def escape_markdown(text):
+    """Экранирует специальные символы для Telegram Markdown."""
+    if not isinstance(text, str):
+        return text
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
+
 def calculate_archetype(answers):
     dims = {'E': 0, 'I': 0, 'S': 0, 'N': 0, 'T': 0, 'F': 0, 'J': 0, 'P': 0}
     for i, ans in enumerate(answers):
@@ -290,12 +297,12 @@ def build_room(user):
     archetype_code = user.get('archetype', '')
     archetype_name = ARCHETYPE_NAMES.get(archetype_code, 'Человек')
     if not phrases:
-        return f"🏠 *Комната {name}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
-    text = f"🏠 *Комната {name}*\n\n"
+        return f"🏠 *Комната {escape_markdown(name)}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
+    text = f"🏠 *Комната {escape_markdown(name)}*\n\n"
     text += f"Ты — {archetype_name}. Ты прошёл(ла) {len(phrases)} из 7 дней.\n\n"
     text += "Твои слова, которые остались со мной:\n\n"
     for i, phrase in enumerate(phrases, 1):
-        text += f"{i}. {phrase}\n"
+        text += f"{i}. {escape_markdown(phrase)}\n"
     if len(phrases) >= 7:
         text += "\n✨ Ты завершил(а) путешествие! Комната наполнилась твоими голосами."
     return text
@@ -515,9 +522,11 @@ def handle_message(chat_id, user_id, user, text):
             save_user_field(user_id, 'character_name', name)
             save_user_field(user_id, 'game_status', 'idle')
             
+            # Экранируем имя для Markdown
+            safe_name = escape_markdown(name)
             welcome_text = (
-                f"✅ Имя **{name}** сохранено!\n\n"
-                f"Отлично! Теперь у тебя есть спутник — **{name}**.\n\n"
+                f"✅ Имя **{safe_name}** сохранено!\n\n"
+                f"Отлично! Теперь у тебя есть спутник — **{safe_name}**.\n\n"
                 "Я — твой помощник по самонаблюдению. Вот что я умею:\n\n"
                 "🧠 **Мой Архетип** — узнать свою суперсилу и зону роста.\n"
                 "📋 **Расписание** — практики и аффирмации на день.\n"
@@ -551,7 +560,7 @@ def handle_message(chat_id, user_id, user, text):
             if status == 'testing':
                 send_message(chat_id, "Ты проходишь тест! Продолжай отвечать на вопросы.")
                 return
-            show_main_menu(chat_id, f"Главное меню, {name}:")
+            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
         elif text == '/test':
             if status == 'testing':
                 send_message(chat_id, "Ты уже проходишь тест! Просто отвечай на вопросы.")
@@ -562,18 +571,18 @@ def handle_message(chat_id, user_id, user, text):
         elif text == '/room':
             show_room(chat_id, user)
         elif text == '/menu':
-            show_main_menu(chat_id, f"Главное меню, {name}:")
+            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
         else:
             show_main_menu(chat_id, "Неизвестная команда. Используй кнопки меню:")
         return
 
     # === КНОПКИ МЕНЮ ===
     if text == "🔙 Назад":
-        show_main_menu(chat_id, f"Главное меню, {name}:")
+        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
         return
 
     if text == "🏠 Главная":
-        show_main_menu(chat_id, f"Главное меню, {name}:")
+        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
         
     elif text == "🧠 Мой Архетип":
         if user.get('archetype'):
@@ -638,7 +647,9 @@ def handle_message(chat_id, user_id, user, text):
         text += f"🚪 Комната: {len(phrases)} из 7 дней\n"
         if phrases:
             text += f"📝 Собрано фраз: {len(phrases)}\n"
-            text += f"🔄 Последняя фраза: {phrases[-1][:40]}..."
+            # экранируем последнюю фразу
+            last_phrase = escape_markdown(phrases[-1])
+            text += f"🔄 Последняя фраза: {last_phrase[:40]}..."
         show_submenu(chat_id, text)
         
     elif text == "⚙️ Настройки":
@@ -670,7 +681,7 @@ def handle_message(chat_id, user_id, user, text):
     
     elif len(text.strip()) >= 2 and not text.startswith('/') and not text in ["🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", "📊 Прогресс", "⚙️ Настройки", "🔙 Назад", "📝 Ответить"]:
         send_message(chat_id, 
-            f"Ты уже зарегистрирован(а) как **{name}**.\n\n"
+            f"Ты уже зарегистрирован(а) как **{escape_markdown(name)}**.\n\n"
             "Используй кнопки меню для навигации 👇"
         )
         show_main_menu(chat_id, "Главное меню:")
