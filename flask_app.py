@@ -17,6 +17,14 @@ if not TOKEN:
 
 CRON_KEY = os.environ.get('CRON_KEY', 'my_secret_key_123')
 
+# Часовой пояс для напоминаний (по умолчанию Москва)
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(os.environ.get('TIMEZONE', 'Europe/Moscow'))
+except ImportError:
+    TZ = None
+    logging.warning("zoneinfo not available, using UTC")
+
 logging.basicConfig(level=logging.INFO)
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "anchor.db")
@@ -118,7 +126,7 @@ ARCHETYPE_NAMES = {
 }
 
 # =============================================
-# ПОЛНЫЕ ИНТЕРПРЕТАЦИИ АРХЕТИПОВ
+# ПОЛНЫЕ ИНТЕРПРЕТАЦИИ АРХЕТИПОВ (16 штук)
 # =============================================
 ARCHETYPE_DESC = {
     "INTJ": (
@@ -541,12 +549,14 @@ def send_keyboard(chat_id, text, keyboard, parse_mode='Markdown'):
         logging.error(f"Ошибка отправки клавиатуры: {e}")
         return None
 
-def show_main_menu(chat_id, text):
+def show_main_menu(chat_id, text, waiting=False):
     main_menu = [
         ["🏠 Главная", "🧠 Мой Архетип"],
         ["📋 Расписание", "🚪 Комната"],
         ["📊 Прогресс", "⚙️ Настройки"]
     ]
+    if waiting:
+        main_menu.insert(0, ["✅ Выполнил(а) практику"])
     keyboard = {
         'keyboard': [[{'text': btn} for btn in row] for row in main_menu],
         'resize_keyboard': True,
@@ -623,7 +633,7 @@ def show_settings(chat_id, user):
     buttons = [
         ["🕒 Установить утро", "🕒 Установить день"],
         ["🕒 Установить вечер", "➕ Добавить задачу"],
-        ["🗑 Удалить задачу", "🔙 Назад"]
+        ["🗑 Удалить задачу", "❌ Отмена"]
     ]
     keyboard = {
         'keyboard': [[{'text': btn} for btn in row] for row in buttons],
@@ -703,6 +713,19 @@ def handle_message(chat_id, user_id, user, text):
     waiting = user.get('waiting_for_practice', 0)
     temp_action = user.get('temp_action')
     temp_data = user.get('temp_data')
+    
+    # =========================================
+    # Сброс temp_action при нажатии навигационных кнопок
+    # =========================================
+    nav_buttons = ["🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", 
+                   "📊 Прогресс", "⚙️ Настройки", "🔙 Назад", "❌ Отмена"]
+    if text in nav_buttons and temp_action:
+        save_user_field(user_id, 'temp_action', None)
+        save_user_field(user_id, 'temp_data', None)
+        temp_action = None
+        temp_data = None
+        user['temp_action'] = None
+        user['temp_data'] = None
     
     # === ФИКС: если пользователь в статусе not_started, но имя уже есть ===
     if status == 'not_started' and user.get('character_name') != 'Мини-Я':
@@ -786,14 +809,12 @@ def handle_message(chat_id, user_id, user, text):
         if temp_action.startswith('set_'):
             # Установка времени для напоминания
             if text.lower() == 'отключить':
-                # Отключаем напоминание
                 field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
                 save_user_field(user_id, field, None)
                 save_user_field(user_id, 'temp_action', None)
                 send_message(chat_id, f"🔕 Напоминание отключено.")
                 show_settings(chat_id, user)
                 return
-            # Проверяем формат времени
             if re.match(r'^\d{1,2}:\d{2}$', text.strip()):
                 field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
                 save_user_field(user_id, field, text.strip())
@@ -806,7 +827,6 @@ def handle_message(chat_id, user_id, user, text):
                 send_message(chat_id, "❌ Неверный формат времени. Напишите время в формате ЧЧ:ММ (например, 08:00) или 'отключить'.")
                 return
         elif temp_action == 'delete_task':
-            # Удаление задачи
             if text.isdigit():
                 idx = int(text)
                 tasks = user.get('custom_tasks', [])
@@ -824,7 +844,6 @@ def handle_message(chat_id, user_id, user, text):
                 send_message(chat_id, "❌ Введите номер задачи (цифру).")
                 return
         elif temp_action == 'add_task':
-            # Добавление задачи
             if not temp_data:
                 save_user_field(user_id, 'temp_data', text)
                 send_message(chat_id, "✅ Текст задачи сохранён. Теперь введите время в формате ЧЧ:ММ (например, 14:00).")
@@ -850,7 +869,7 @@ def handle_message(chat_id, user_id, user, text):
             if status == 'testing':
                 send_message(chat_id, "Ты проходишь тест! Продолжай отвечать на вопросы.")
                 return
-            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
+            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
         elif text == '/test':
             if status == 'testing':
                 send_message(chat_id, "Ты уже проходишь тест! Просто отвечай на вопросы.")
@@ -861,18 +880,19 @@ def handle_message(chat_id, user_id, user, text):
         elif text == '/room':
             show_room(chat_id, user)
         elif text == '/menu':
-            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
+            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
         else:
-            show_main_menu(chat_id, "Неизвестная команда. Используй кнопки меню:")
+            show_main_menu(chat_id, "Неизвестная команда. Используй кнопки меню:", waiting=waiting)
         return
 
     # === КНОПКИ МЕНЮ ===
     if text == "🔙 Назад":
-        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
+        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
         return
 
     if text == "🏠 Главная":
-        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:")
+        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
+        return
         
     elif text == "🧠 Мой Архетип":
         if user.get('archetype'):
@@ -888,13 +908,12 @@ def handle_message(chat_id, user_id, user, text):
         if archetype:
             sched = get_schedule(archetype)
             name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
-            # Формируем красивое расписание с воздухом
             static_text = f"📋 *Расписание для архетипа «{name_archetype}»*\n\n"
             for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
                 title, practice, affirmation = sched[period]
                 static_text += f"*{label}*\n"
                 static_text += f"📌 {practice}\n"
-                static_text += f"💬 _{affirmation}_\n\n"  # две пустые строки для воздуха
+                static_text += f"💬 _{affirmation}_\n\n"
             buttons = [["🔙 Назад"]]
             if waiting:
                 buttons.append(["✅ Выполнил(а) практику"])
@@ -910,10 +929,11 @@ def handle_message(chat_id, user_id, user, text):
     elif text == "🚪 Комната":
         if user.get('character_name') == 'Мини-Я':
             send_message(chat_id, "Сначала зарегистрируйся через /start и дай имя своему Мини-Ты.")
-            show_main_menu(chat_id, "Главное меню:")
+            show_main_menu(chat_id, "Главное меню:", waiting=waiting)
             return
         
         # Проверка таймера
+        can_enter = True
         if status == 'idle' and day > 0:
             last_date_str = user.get('last_day_completed_date')
             if last_date_str:
@@ -921,20 +941,23 @@ def handle_message(chat_id, user_id, user, text):
                     last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
                     today = date.today()
                     if last_date >= today:
-                        send_message(chat_id, 
-                            "⏳ Следующий день откроется завтра.\n"
-                            "Ты можешь пока посмотреть 📋 Расписание или 📊 Прогресс."
-                        )
-                        show_main_menu(chat_id, "Главное меню:")
-                        return
+                        can_enter = False
                 except:
                     pass
+        
+        if not can_enter:
+            msg = "⏳ Следующий день откроется завтра.\nТы можешь пока посмотреть 📋 Расписание или 📊 Прогресс."
+            if waiting:
+                msg += "\n\nКогда выполнишь практику — нажми ✅ Выполнил(а) практику."
+            send_message(chat_id, msg)
+            show_main_menu(chat_id, "Главное меню:", waiting=waiting)
+            return
         
         if waiting:
             send_message(chat_id, 
                 "🔒 Ты завершил(а) день, но чтобы перейти к следующему, выполни практику из расписания и нажми '✅ Выполнил(а) практику'."
             )
-            show_main_menu(chat_id, "Главное меню:")
+            show_main_menu(chat_id, "Главное меню:", waiting=True)
             return
         elif status == 'idle' and day > 0:
             save_user_field(user_id, 'game_status', 'active')
@@ -944,8 +967,6 @@ def handle_message(chat_id, user_id, user, text):
             save_user_field(user_id, 'game_day', 1)
             show_game_question(chat_id, user_id, 1)
         elif status == 'active':
-            # В активном состоянии любой текст (кроме команд и кнопок) считаем ответом
-            # Но если пользователь нажал кнопку "Назад" или "Выйти" – они обработаны выше
             show_game_question(chat_id, user_id, day)
         elif status == 'completed':
             show_room(chat_id, user)
@@ -953,7 +974,7 @@ def handle_message(chat_id, user_id, user, text):
             if user.get('character_name') != 'Мини-Я':
                 save_user_field(user_id, 'game_status', 'idle')
                 send_message(chat_id, "Восстанавливаем твой прогресс. Нажми 🚪 Комната снова.")
-                show_main_menu(chat_id, "Главное меню:")
+                show_main_menu(chat_id, "Главное меню:", waiting=waiting)
             else:
                 send_message(chat_id, "Сначала пройди тест 🧠 Мой Архетип")
         
@@ -968,33 +989,52 @@ def handle_message(chat_id, user_id, user, text):
         if phrases:
             text += f"📝 Собрано фраз: {len(phrases)}\n"
             last_phrase = escape_markdown(phrases[-1])
-            text += f"🔄 Последняя фраза: {last_phrase[:40]}..."
+            text += f"🔄 Последняя фраза: {last_phrase}\n"
         else:
             text += f"🔄 Текущий день: {day} (если начат)"
-        show_submenu(chat_id, text)
+        buttons = [["📖 История"], ["🔙 Назад"]]
+        keyboard = {
+            'keyboard': [[{'text': btn} for btn in row] for row in buttons],
+            'resize_keyboard': True,
+            'one_time_keyboard': True
+        }
+        send_keyboard(chat_id, text, keyboard)
+        return
+        
+    elif text == "📖 История":
+        phrases = user.get('key_phrases', [])
+        if not phrases:
+            send_message(chat_id, "История пуста. Пройди Комнату, чтобы собрать свои фразы.")
+        else:
+            hist = "📖 *Твоя история:*\n\n"
+            for i, phrase in enumerate(phrases, 1):
+                hist += f"{i}. {escape_markdown(phrase)}\n\n"
+            send_message(chat_id, hist)
+        show_submenu(chat_id, "Выбери действие:")
+        return
         
     elif text == "⚙️ Настройки":
         show_settings(chat_id, user)
     
     # === КНОПКИ НАСТРОЕК (устанавливают состояние) ===
-    elif text.startswith("🕒 Установить утро"):
+    elif text == "🕒 Установить утро":
         save_user_field(user_id, 'temp_action', 'set_morning')
         send_message(chat_id, "Введите время для утренней практики в формате ЧЧ:ММ (например, 08:00) или напишите 'отключить'.")
         return
-    elif text.startswith("🕒 Установить день"):
+    elif text == "🕒 Установить день":
         save_user_field(user_id, 'temp_action', 'set_day')
         send_message(chat_id, "Введите время для дневной практики в формате ЧЧ:ММ (например, 13:00) или напишите 'отключить'.")
         return
-    elif text.startswith("🕒 Установить вечер"):
+    elif text == "🕒 Установить вечер":
         save_user_field(user_id, 'temp_action', 'set_evening')
         send_message(chat_id, "Введите время для вечерней практики в формате ЧЧ:ММ (например, 21:00) или напишите 'отключить'.")
         return
-    elif text.startswith("➕ Добавить задачу"):
+    elif text == "➕ Добавить задачу":
         save_user_field(user_id, 'temp_action', 'add_task')
         save_user_field(user_id, 'temp_data', None)
         send_message(chat_id, "Введите текст задачи (без времени). Затем я попрошу указать время.")
         return
-    elif text.startswith("🗑 Удалить задачу"):
+    elif text == "🗑 Удалить задачу":
         tasks = user.get('custom_tasks', [])
         if not tasks:
             send_message(chat_id, "У вас нет добавленных задач.")
@@ -1005,17 +1045,56 @@ def handle_message(chat_id, user_id, user, text):
         send_message(chat_id, f"📝 *Ваши задачи:*\n\n{task_list}\n\nНапишите номер задачи, которую нужно удалить.")
         return
 
+    # === ОБРАБОТКА КНОПКИ ВЫПОЛНЕНИЯ ПРАКТИКИ (с автоматическим переходом) ===
+    elif text and text.strip().startswith("✅") and "практику" in text.strip().lower():
+        logging.info(f"Нажата кнопка практики, waiting={waiting}, day={day}")
+        if waiting:
+            save_user_field(user_id, 'waiting_for_practice', 0)
+            save_user_field(user_id, 'practice_done', 1)
+            next_day = day + 1
+            if next_day <= 7:
+                # Проверка таймера
+                can_proceed = True
+                last_date_str = user.get('last_day_completed_date')
+                if last_date_str:
+                    try:
+                        last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
+                        today = date.today()
+                        if last_date >= today:
+                            can_proceed = False
+                    except:
+                        pass
+                if can_proceed:
+                    save_user_field(user_id, 'game_day', next_day)
+                    save_user_field(user_id, 'game_status', 'active')
+                    send_message(chat_id, f"✅ Отлично! Переходим к Дню {next_day}.")
+                    show_game_question(chat_id, user_id, next_day)
+                else:
+                    save_user_field(user_id, 'game_status', 'idle')
+                    send_message(chat_id, "✅ Отлично! Ты выполнил(а) практику, но следующий день откроется завтра.\nТы можешь пока посмотреть 📋 Расписание или 📊 Прогресс.")
+                    show_main_menu(chat_id, "Главное меню:", waiting=False)
+            else:
+                # Завершение игры
+                save_user_field(user_id, 'game_status', 'completed')
+                room_text = build_room(user)
+                send_message(chat_id,
+                    f"🎉 *Поздравляю!*\n\n"
+                    f"Ты прошёл(ла) все 7 дней!\n\n"
+                    f"{room_text}"
+                )
+                show_main_menu(chat_id, "Главное меню:")
+        else:
+            send_message(chat_id, "Тебе не нужно отмечать практику прямо сейчас. Пройди день в Комнате, а затем выполни практику.")
+
     # === ОБРАБОТКА ИГРЫ (активный статус) ===
     elif status == 'active':
-        # Любой текст (кроме явных команд и кнопок, которые уже отловлены) считаем ответом
         handle_game_answer(chat_id, user_id, user, text)
     
     elif status == 'testing':
         handle_test_answer(chat_id, user_id, user, text)
     
-    # === НЕИЗВЕСТНЫЙ ТЕКСТ (возможно, попытка добавить задачу без кнопки) ===
+    # === НЕИЗВЕСТНЫЙ ТЕКСТ ===
     else:
-        # Проверяем, не является ли текст форматом "задача в 14:00" для быстрого добавления
         match = re.search(r'(\d{1,2}:\d{2})', text)
         if match:
             time_str = match.group(1)
@@ -1030,7 +1109,7 @@ def handle_message(chat_id, user_id, user, text):
             return
         else:
             send_message(chat_id, "Используй кнопки меню 👇")
-            show_main_menu(chat_id, "Главное меню:")
+            show_main_menu(chat_id, "Главное меню:", waiting=waiting)
 
 # =============================================
 # ЛОГИКА ТЕСТА
@@ -1129,7 +1208,6 @@ def handle_game_answer(chat_id, user_id, user, text):
     
     # Проверяем, не является ли текст командой или кнопкой, которые не должны быть ответом
     if text.startswith('/') or text in ["🔙 Назад", "🚪 Выйти из комнаты", "🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", "📊 Прогресс", "⚙️ Настройки"]:
-        # Эти команды и кнопки обрабатываются в основном цикле, здесь их игнорируем
         return
     
     # Сохраняем ответ
@@ -1146,38 +1224,29 @@ def handle_game_answer(chat_id, user_id, user, text):
     
     next_day = day + 1
     
-    # Сохраняем дату завершения дня
+    # Сохраняем дату завершения дня (НЕ сдвигаем game_day, он остаётся текущим)
     today_str = date.today().isoformat()
     save_user_field(user_id, 'last_day_completed_date', today_str)
+    save_user_field(user_id, 'waiting_for_practice', 1)
+    save_user_field(user_id, 'game_status', 'idle')
     
     if next_day > 7:
-        save_user_field(user_id, 'game_status', 'completed')
-        room_text = build_room(user)
+        # Игра завершена (но практика ещё будет выполняться)
         send_message(chat_id,
-            f"🎉 *Поздравляю!*\n\n"
-            f"Ты прошёл(ла) все 7 дней!\n\n"
+            f"✅ *День {day} завершён!*\n\n"
             f"{day_data['response']}\n\n"
-            f"{room_text}"
+            f"🎉 Ты прошёл(ла) все 7 дней! Осталось выполнить практику, чтобы завершить путешествие."
         )
-        show_main_menu(chat_id, "Главное меню:")
     else:
-        save_user_field(user_id, 'game_day', next_day)
-        save_user_field(user_id, 'waiting_for_practice', 1)
-        save_user_field(user_id, 'game_status', 'idle')
         send_message(chat_id,
             f"✅ *День {day} завершён!*\n\n"
             f"{day_data['response']}\n\n"
             f"📅 *Завтра — День {next_day}.*\n"
             f"Чтобы открыть следующий день, выполни практику из расписания и нажми '✅ Выполнил(а) практику'.\n"
-            f"Новый день откроется только завтра.\n"
-            f"А пока нажми кнопку ниже, когда выполнишь практику:",
-            reply_markup=json.dumps({
-                'keyboard': [[{'text': '✅ Выполнил(а) практику'}]],
-                'resize_keyboard': True,
-                'one_time_keyboard': True
-            })
+            f"Новый день откроется только завтра."
         )
-        show_main_menu(chat_id, "Главное меню:")
+    # Показываем главное меню с кнопкой практики
+    show_main_menu(chat_id, "Главное меню:", waiting=True)
 
 def show_room(chat_id, user):
     room_text = build_room(user)
@@ -1193,8 +1262,13 @@ def cron():
         return "Forbidden", 403
     
     try:
-        now = datetime.now()
+        # Текущее время с учётом часового пояса
+        if TZ:
+            now = datetime.now(TZ)
+        else:
+            now = datetime.now()
         current_time = now.strftime("%H:%M")
+        logging.info(f"Cron вызван в {current_time}")
         
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -1222,8 +1296,16 @@ def cron():
                             f"💬 _{affirmation}_"
                         )
             
-            # Добавленные задачи
-            custom_tasks = user.get('custom_tasks', [])
+            # Добавленные задачи (парсим JSON)
+            custom_tasks_raw = user.get('custom_tasks', '[]')
+            if isinstance(custom_tasks_raw, str):
+                try:
+                    custom_tasks = json.loads(custom_tasks_raw or '[]')
+                except:
+                    custom_tasks = []
+            else:
+                custom_tasks = custom_tasks_raw
+            
             for task in custom_tasks:
                 if task.get('time') == current_time:
                     send_message(chat_id,
