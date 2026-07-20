@@ -259,7 +259,6 @@ GAME_DAYS = {
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =============================================
 def escape_markdown(text):
-    """Экранирует специальные символы для Telegram Markdown."""
     if not isinstance(text, str):
         return text
     escape_chars = r'_*[]()~`>#+-=|{}.!'
@@ -522,7 +521,6 @@ def handle_message(chat_id, user_id, user, text):
             save_user_field(user_id, 'character_name', name)
             save_user_field(user_id, 'game_status', 'idle')
             
-            # Экранируем имя для Markdown
             safe_name = escape_markdown(name)
             welcome_text = (
                 f"✅ Имя **{safe_name}** сохранено!\n\n"
@@ -602,7 +600,6 @@ def handle_message(chat_id, user_id, user, text):
             for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
                 title, practice, affirmation = sched[period]
                 text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
-            # Добавляем кнопку для отметки выполнения практики
             buttons = [["🔙 Назад"]]
             if waiting:
                 buttons.append(["✅ Выполнил(а) практику"])
@@ -616,17 +613,23 @@ def handle_message(chat_id, user_id, user, text):
             send_message(chat_id, "Сначала определи свой архетип через 🧠 Мой Архетип")
             
     elif text == "🚪 Комната":
+        # === ИСПРАВЛЕНИЕ: проверяем, зарегистрирован ли пользователь ===
+        if user.get('character_name') == 'Мини-Я':
+            # пользователь не зарегистрирован
+            send_message(chat_id, "Сначала зарегистрируйся через /start и дай имя своему Мини-Ты.")
+            show_main_menu(chat_id, "Главное меню:")
+            return
+        
         if waiting:
             send_message(chat_id, 
                 "🔒 Ты завершил(а) день, но чтобы перейти к следующему, выполни практику из расписания и нажми '✅ Выполнил(а) практику'."
             )
             show_main_menu(chat_id, "Главное меню:")
+            return
         elif status == 'idle' and day > 0:
-            # Если игра уже начата, но статус idle — возобновляем
             save_user_field(user_id, 'game_status', 'active')
             show_game_question(chat_id, user_id, day)
         elif status == 'idle' and day == 0:
-            # Начинаем новую игру
             save_user_field(user_id, 'game_status', 'active')
             save_user_field(user_id, 'game_day', 1)
             show_game_question(chat_id, user_id, 1)
@@ -635,7 +638,13 @@ def handle_message(chat_id, user_id, user, text):
         elif status == 'completed':
             show_room(chat_id, user)
         else:
-            send_message(chat_id, "Сначала пройди тест 🧠 Мой Архетип")
+            # Если статус not_started, но имя уже есть — восстанавливаем
+            if user.get('character_name') != 'Мини-Я':
+                save_user_field(user_id, 'game_status', 'idle')
+                send_message(chat_id, "Восстанавливаем твой прогресс. Нажми 🚪 Комната снова.")
+                show_main_menu(chat_id, "Главное меню:")
+            else:
+                send_message(chat_id, "Сначала пройди тест 🧠 Мой Архетип")
         
     elif text == "📊 Прогресс":
         archetype = user.get('archetype')
@@ -647,7 +656,6 @@ def handle_message(chat_id, user_id, user, text):
         text += f"🚪 Комната: {len(phrases)} из 7 дней\n"
         if phrases:
             text += f"📝 Собрано фраз: {len(phrases)}\n"
-            # экранируем последнюю фразу
             last_phrase = escape_markdown(phrases[-1])
             text += f"🔄 Последняя фраза: {last_phrase[:40]}..."
         show_submenu(chat_id, text)
@@ -806,7 +814,6 @@ def handle_game_answer(chat_id, user_id, user, text):
     day_data = get_game_day(day)
     phrase = extract_key_phrase(text)
     
-    # Сохраняем ответ и ключевую фразу
     answers = user['game_answers']
     answers.append(text)
     save_user_field(user_id, 'game_answers', answers)
@@ -815,11 +822,9 @@ def handle_game_answer(chat_id, user_id, user, text):
     phrases.append(phrase)
     save_user_field(user_id, 'key_phrases', phrases)
     
-    # Переход на следующий день
     next_day = day + 1
     
     if next_day > 7:
-        # Игра завершена
         save_user_field(user_id, 'game_status', 'completed')
         room_text = build_room(user)
         send_message(chat_id,
@@ -830,10 +835,9 @@ def handle_game_answer(chat_id, user_id, user, text):
         )
         show_main_menu(chat_id, "Главное меню:")
     else:
-        # Разблокируем практику
         save_user_field(user_id, 'game_day', next_day)
         save_user_field(user_id, 'waiting_for_practice', 1)
-        save_user_field(user_id, 'game_status', 'idle')  # переводим в idle, чтобы не показывать сразу следующий день
+        save_user_field(user_id, 'game_status', 'idle')
         send_message(chat_id,
             f"✅ *День {day} завершён!*\n\n"
             f"{day_data['response']}\n\n"
