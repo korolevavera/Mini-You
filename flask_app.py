@@ -70,23 +70,16 @@ def save_user_field(user_id, field, value):
     conn.commit()
     conn.close()
 
-def reset_user(user_id):
+def delete_user(user_id):
+    """Полностью удаляет пользователя."""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """UPDATE users 
-           SET character_name = 'Мини-Я', 
-               archetype = NULL, 
-               game_status = 'not_started', 
-               test_answers = '[]'
-           WHERE user_id = ?""",
-        (user_id,)
-    )
+    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
-    logging.info(f"User {user_id} reset")
+    logging.info(f"User {user_id} deleted")
 
 # =============================================
-# ТЕСТ (вопросы без эмодзи для надёжности)
+# ТЕСТ
 # =============================================
 QUICK_TEST = [
     {
@@ -366,12 +359,19 @@ def handle_message(chat_id, user_id, user, text):
     status = user.get('game_status')
     name = user.get('character_name', 'Мини-Я')
     
-    # СЕКРЕТНАЯ КОМАНДА СБРОСА
+    # === ФИКС: если пользователь в статусе not_started, но имя уже есть — переводим в idle ===
+    if status == 'not_started' and user.get('character_name') != 'Мини-Я':
+        save_user_field(user_id, 'game_status', 'idle')
+        status = 'idle'
+        user['game_status'] = 'idle'
+    
+    # === СЕКРЕТНАЯ КОМАНДА СБРОСА (теперь удаляет полностью) ===
     if text == '/reset_me':
-        reset_user(user_id)
+        delete_user(user_id)
         send_message(chat_id, "🔄 Аккаунт полностью сброшен! Теперь ты как новый пользователь.\n\nНапиши /start, чтобы начать с приветствия.")
         return
 
+    # === НОВЫЙ ПОЛЬЗОВАТЕЛЬ ===
     if status == 'not_started':
         if text == '/start':
             welcome_text = (
@@ -435,6 +435,7 @@ def handle_message(chat_id, user_id, user, text):
         )
         return
 
+    # === ЗАРЕГИСТРИРОВАННЫЙ ПОЛЬЗОВАТЕЛЬ ===
     if text.startswith('/'):
         if text == '/start':
             if status == 'testing':
