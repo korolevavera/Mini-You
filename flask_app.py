@@ -1253,12 +1253,13 @@ def show_room(chat_id, user):
     send_message(chat_id, room_text)
 
 # =============================================
-# CRON для напоминаний
+# CRON для напоминаний (исправлен)
 # =============================================
 @app.route('/cron', methods=['GET'])
 def cron():
     key = request.args.get('key')
     if key != CRON_KEY:
+        logging.warning(f"Cron: неверный ключ {key}")
         return "Forbidden", 403
     
     try:
@@ -1278,12 +1279,14 @@ def cron():
         for row in rows:
             user = dict(row)
             user_id = user['user_id']
-            chat_id = user_id
+            chat_id = user_id  # chat_id == user_id для ботов
+            
+            # Пропускаем, если нет архетипа
             archetype = user.get('archetype')
             if not archetype:
                 continue
             
-            # Напоминания по расписанию
+            # --- Напоминания по расписанию ---
             for period, field in [("morning", "reminder_morning"), ("day", "reminder_day"), ("evening", "reminder_evening")]:
                 reminder_time = user.get(field)
                 if reminder_time and reminder_time == current_time:
@@ -1296,25 +1299,29 @@ def cron():
                             f"💬 _{affirmation}_"
                         )
             
-            # Добавленные задачи (парсим JSON)
+            # --- Добавленные задачи (парсим JSON безопасно) ---
             custom_tasks_raw = user.get('custom_tasks', '[]')
-            if isinstance(custom_tasks_raw, str):
-                try:
-                    custom_tasks = json.loads(custom_tasks_raw or '[]')
-                except:
-                    custom_tasks = []
-            else:
-                custom_tasks = custom_tasks_raw
+            custom_tasks = []
+            if custom_tasks_raw:
+                if isinstance(custom_tasks_raw, str):
+                    try:
+                        custom_tasks = json.loads(custom_tasks_raw)
+                    except json.JSONDecodeError as e:
+                        logging.error(f"Ошибка парсинга custom_tasks для user {user_id}: {e}, значение: {custom_tasks_raw}")
+                        custom_tasks = []
+                elif isinstance(custom_tasks_raw, list):
+                    custom_tasks = custom_tasks_raw
+                else:
+                    logging.warning(f"custom_tasks для user {user_id} имеет неожиданный тип: {type(custom_tasks_raw)}")
             
             for task in custom_tasks:
                 if task.get('time') == current_time:
-                    send_message(chat_id,
-                        f"⏰ *Напоминание*\n\n{task['text']}"
-                    )
+                    task_text = task.get('text', 'Напоминание')
+                    send_message(chat_id, f"⏰ *Напоминание*\n\n{task_text}")
         
         return "OK", 200
     except Exception as e:
-        logging.error(f"Cron error: {e}")
+        logging.error(f"Cron error: {e}", exc_info=True)
         return "Error", 500
 
 # =============================================
