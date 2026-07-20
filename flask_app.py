@@ -34,6 +34,8 @@ def init_db():
             game_day INTEGER DEFAULT 0,
             game_answers TEXT DEFAULT '[]',
             key_phrases TEXT DEFAULT '[]',
+            waiting_for_practice INTEGER DEFAULT 0,
+            practice_done INTEGER DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now'))
         )
     ''')
@@ -127,7 +129,7 @@ ARCHETYPE_DESC = {
 }
 
 # =============================================
-# РАСПИСАНИЕ
+# РАСПИСАНИЕ ДЛЯ ВСЕХ 16 АРХЕТИПОВ
 # =============================================
 SCHEDULE = {
     "INTJ": {
@@ -287,10 +289,8 @@ def build_room(user):
     name = user.get('character_name', 'Мини-Я')
     archetype_code = user.get('archetype', '')
     archetype_name = ARCHETYPE_NAMES.get(archetype_code, 'Человек')
-    
     if not phrases:
         return f"🏠 *Комната {name}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
-    
     text = f"🏠 *Комната {name}*\n\n"
     text += f"Ты — {archetype_name}. Ты прошёл(ла) {len(phrases)} из 7 дней.\n\n"
     text += "Твои слова, которые остались со мной:\n\n"
@@ -467,6 +467,7 @@ def handle_message(chat_id, user_id, user, text):
     status = user.get('game_status')
     name = user.get('character_name', 'Мини-Я')
     day = user.get('game_day', 0)
+    waiting = user.get('waiting_for_practice', 0)
     
     # === ФИКС: если пользователь в статусе not_started, но имя уже есть ===
     if status == 'not_started' and user.get('character_name') != 'Мини-Я':
@@ -592,13 +593,27 @@ def handle_message(chat_id, user_id, user, text):
             for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
                 title, practice, affirmation = sched[period]
                 text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
-            show_submenu(chat_id, text)
+            # Добавляем кнопку для отметки выполнения практики
+            buttons = [["🔙 Назад"]]
+            if waiting:
+                buttons.append(["✅ Выполнил(а) практику"])
+            keyboard = {
+                'keyboard': [[{'text': btn} for btn in row] for row in buttons],
+                'resize_keyboard': True,
+                'one_time_keyboard': True
+            }
+            send_keyboard(chat_id, text, keyboard)
         else:
             send_message(chat_id, "Сначала определи свой архетип через 🧠 Мой Архетип")
             
     elif text == "🚪 Комната":
-        if status == 'idle' and day > 0:
-            # Возобновляем игру
+        if waiting:
+            send_message(chat_id, 
+                "🔒 Ты завершил(а) день, но чтобы перейти к следующему, выполни практику из расписания и нажми '✅ Выполнил(а) практику'."
+            )
+            show_main_menu(chat_id, "Главное меню:")
+        elif status == 'idle' and day > 0:
+            # Если игра уже начата, но статус idle — возобновляем
             save_user_field(user_id, 'game_status', 'active')
             show_game_question(chat_id, user_id, day)
         elif status == 'idle' and day == 0:
@@ -632,6 +647,19 @@ def handle_message(chat_id, user_id, user, text):
             "Здесь можно настроить напоминания и управлять данными.\n\n"
             "_(Функция появится в следующем обновлении!)_"
         )
+    
+    # === КНОПКА ВЫПОЛНЕНИЯ ПРАКТИКИ ===
+    elif text == "✅ Выполнил(а) практику":
+        if waiting:
+            save_user_field(user_id, 'waiting_for_practice', 0)
+            save_user_field(user_id, 'practice_done', 1)
+            send_message(chat_id, 
+                "✅ Отлично! Ты выполнил(а) практику. Теперь тебе открыт доступ к следующему дню.\n"
+                "Нажми 🚪 Комната, чтобы продолжить."
+            )
+            show_main_menu(chat_id, "Главное меню:")
+        else:
+            send_message(chat_id, "Тебе не нужно отмечать практику прямо сейчас. Пройди день в Комнате, а затем выполни практику.")
     
     # === ОБРАБОТКА ИГРЫ ===
     elif status == 'active':
@@ -791,12 +819,16 @@ def handle_game_answer(chat_id, user_id, user, text):
         )
         show_main_menu(chat_id, "Главное меню:")
     else:
+        # Разблокируем практику
         save_user_field(user_id, 'game_day', next_day)
+        save_user_field(user_id, 'waiting_for_practice', 1)
+        save_user_field(user_id, 'game_status', 'idle')  # переводим в idle, чтобы не показывать сразу следующий день
         send_message(chat_id,
             f"✅ *День {day} завершён!*\n\n"
             f"{day_data['response']}\n\n"
             f"📅 *Завтра — День {next_day}.*\n"
-            f"Нажми 🚪 Комната, чтобы продолжить."
+            f"Но прежде чем продолжить, открой 📋 Расписание, выполни практику и нажми '✅ Выполнил(а) практику'.\n"
+            f"Это поможет тебе закрепить полученное."
         )
         show_main_menu(chat_id, "Главное меню:")
 
