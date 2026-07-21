@@ -5,6 +5,7 @@ import sqlite3
 import logging
 import re
 import time
+import threading
 from datetime import datetime, timedelta, date
 from flask import Flask, request
 import requests
@@ -48,12 +49,13 @@ def init_db():
             reminder_day TEXT,
             reminder_evening TEXT,
             custom_tasks TEXT DEFAULT '[]',
+            custom_practices TEXT DEFAULT '[]',
             temp_action TEXT,
             temp_data TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         )
     ''')
-    # Таблица новеллы (добавляем, если нет)
+    # Таблица новеллы
     conn.execute('''
         CREATE TABLE IF NOT EXISTS novel_state (
             user_id INTEGER PRIMARY KEY,
@@ -63,31 +65,6 @@ def init_db():
             completed INTEGER DEFAULT 0,
             paid INTEGER DEFAULT 0,
             updated_at TEXT DEFAULT (datetime('now'))
-        )
-    ''')
-    # Таблица практик (добавляем для совместимости)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS practices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            name TEXT NOT NULL,
-            description TEXT,
-            category TEXT,
-            schedule_time TEXT,
-            schedule_days TEXT,
-            is_custom INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    ''')
-    # Прогресс практик
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS practice_progress (
-            user_id INTEGER,
-            practice_id INTEGER,
-            completed_count INTEGER DEFAULT 0,
-            streak INTEGER DEFAULT 0,
-            last_used TEXT,
-            PRIMARY KEY (user_id, practice_id)
         )
     ''')
     conn.commit()
@@ -105,6 +82,7 @@ def get_user(user_id):
     user['game_answers'] = json.loads(user['game_answers'] or '[]')
     user['key_phrases'] = json.loads(user['key_phrases'] or '[]')
     user['custom_tasks'] = json.loads(user['custom_tasks'] or '[]')
+    user['custom_practices'] = json.loads(user['custom_practices'] or '[]')
     return user
 
 def get_or_create_user(user_id, username=None):
@@ -136,9 +114,9 @@ def delete_user(user_id):
     conn.close()
     logging.info(f"User {user_id} deleted")
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # НОВЕЛЛА (7 эпизодов)
-# =============================================
+# ──────────────────────────────────────────────────────────────
 NOVEL_EPISODES = [
     {
         "id": 1,
@@ -258,23 +236,12 @@ def get_episode(episode_id):
     return None
 
 def calculate_archetype_from_params(params):
-    # Простая логика: если параметры указывают на определённый тип
-    # Пока заглушка — используем ENFP если ничего не подходит
-    # В будущем можно сделать более сложную систему
+    # Простая логика: если параметров мало, возвращаем ENFP как пример
     return "ENFP"
 
-def get_archetype_name(code):
-    names = {
-        "INTJ": "Дирижёр", "ENTJ": "Командир", "INTP": "Мыслитель", "ENTP": "Новатор",
-        "INFJ": "Наставник", "ENFJ": "Вдохновитель", "ISTJ": "Хранитель", "ESTJ": "Администратор",
-        "ISFJ": "Заботливый", "ESFJ": "Душа компании", "ISTP": "Мастер", "ESTP": "Искатель",
-        "ISFP": "Художник", "ESFP": "Жизнелюб", "INFP": "Идеалист", "ENFP": "Исследователь"
-    }
-    return names.get(code, "Человек")
-
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # ТЕСТ (12 вопросов)
-# =============================================
+# ──────────────────────────────────────────────────────────────
 QUICK_TEST = [
     {"question": "Когда у тебя свободный вечер, ты скорее...", "option_a": "Побудешь дома в тишине", "option_b": "Позвонишь другу или выйдешь в люди", "a_dim": "I", "b_dim": "E"},
     {"question": "Принимая важное решение, ты опираешься на...", "option_a": "Конкретные факты и опыт", "option_b": "Интуицию и общую картину", "a_dim": "S", "b_dim": "N"},
@@ -297,8 +264,27 @@ ARCHETYPE_NAMES = {
     "ISFP": "Художник", "ESFP": "Жизнелюб", "INFP": "Идеалист", "ENFP": "Исследователь"
 }
 
-# ПОЛНЫЕ ОПИСАНИЯ АРХЕТИПОВ (16 штук)
-ARCHETYPE_DESC = {
+# Полные интерпретации (16 штук) – сокращённые для быстрого показа, но полные доступны по /archetype
+ARCHETYPE_SHORT_DESC = {
+    "INTJ": "Ты — Дирижёр. Ты строишь системы из хаоса. Твоя зона роста — научиться отдыхать и не брать всё на себя.",
+    "ENTJ": "Ты — Командир. Ты ведёшь за собой и достигаешь целей. Твоя зона роста — быть добрее к себе и другим.",
+    "INTP": "Ты — Мыслитель. Ты находишь нестандартные решения. Твоя зона роста — переходить от анализа к действию.",
+    "ENTP": "Ты — Новатор. Ты генерируешь идеи. Твоя зона роста — доводить начатое до конца.",
+    "INFJ": "Ты — Наставник. Ты понимаешь и вдохновляешь людей. Твоя зона роста — заботиться о себе так же, как о других.",
+    "ENFJ": "Ты — Вдохновитель. Ты заряжаешь других энергией. Твоя зона роста — не выгорать, замечая свои потребности.",
+    "ISTJ": "Ты — Хранитель. Ты надёжная опора. Твоя зона роста — учиться гибкости и переменам.",
+    "ESTJ": "Ты — Администратор. Ты наводишь порядок. Твоя зона роста — смягчать требовательность к себе и другим.",
+    "ISFJ": "Ты — Заботливый. Ты внимателен к деталям и людям. Твоя зона роста — помнить о своих желаниях.",
+    "ESFJ": "Ты — Душа компании. Ты объединяешь людей. Твоя зона роста — находить опору в себе, а не в чужих оценках.",
+    "ISTP": "Ты — Мастер. Ты разбираешься в механизмах. Твоя зона роста — не избегать обязательств.",
+    "ESTP": "Ты — Искатель. Ты быстро действуешь. Твоя зона роста — думать о последствиях.",
+    "ISFP": "Ты — Художник. Ты создаёшь красоту. Твоя зона роста — не прятаться от критики.",
+    "ESFP": "Ты — Жизнелюб. Ты наполняешь жизнь красками. Твоя зона роста — не избегать глубоких тем.",
+    "INFP": "Ты — Идеалист. Ты видишь хорошее в людях. Твоя зона роста — воплощать мечты в реальность.",
+    "ENFP": "Ты — Исследователь. Ты открываешь новые возможности. Твоя зона роста — доводить дела до конца."
+}
+
+ARCHETYPE_FULL_DESC = {
     "INTJ": (
         "Ты — Дирижёр. Там, где другие видят хаос, ты видишь будущую систему. "
         "Тебе легко держать в голове большую картину: куда всё движется, что важно, а что — шум. "
@@ -495,9 +481,9 @@ ARCHETYPE_DESC = {
     )
 }
 
-# =============================================
-# РАСПИСАНИЕ
-# =============================================
+# ──────────────────────────────────────────────────────────────
+# ПРАКТИКИ ДЛЯ КАЖДОГО АРХЕТИПА (из SCHEDULE)
+# ──────────────────────────────────────────────────────────────
 SCHEDULE = {
     "INTJ": {
         "morning": ("Утро Дирижёра", "Запиши 3 приоритета дня — без лишнего.", "Я строю то, что имеет значение."),
@@ -588,9 +574,9 @@ def get_practice_text(archetype, period):
     sched = get_schedule(archetype)
     return sched.get(period, ("", "", ""))
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =============================================
+# ──────────────────────────────────────────────────────────────
 def escape_markdown(text):
     if not isinstance(text, str):
         return text
@@ -621,7 +607,7 @@ def build_room(user):
     phrases = user.get('key_phrases', [])
     name = user.get('character_name', 'Мини-Я')
     archetype_code = user.get('archetype', '')
-    archetype_name = get_archetype_name(archetype_code)
+    archetype_name = ARCHETYPE_NAMES.get(archetype_code, 'Человек')
     if not phrases:
         return f"🏠 *Комната {escape_markdown(name)}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
     text = f"🏠 *Комната {escape_markdown(name)}*\n\n"
@@ -633,9 +619,9 @@ def build_room(user):
         text += "\n✨ Ты завершил(а) путешествие! Комната наполнилась твоими голосами."
     return text
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # ОТПРАВКА СООБЩЕНИЙ
-# =============================================
+# ──────────────────────────────────────────────────────────────
 def send_action(chat_id, action='typing'):
     url = f"https://api.telegram.org/bot{TOKEN}/sendChatAction"
     payload = {'chat_id': chat_id, 'action': action}
@@ -680,7 +666,7 @@ def show_main_menu(chat_id, text, waiting=False):
         ["🏠 Главная", "🧠 Мой Архетип"],
         ["📋 Расписание", "🚪 Комната"],
         ["📊 Прогресс", "🧘 Практики"],
-        ["⚙️ Настройки"]
+        ["⚙️ Настройki"]
     ]
     if waiting:
         main_menu.insert(0, ["✅ Выполнил(а) практику"])
@@ -699,34 +685,15 @@ def show_submenu(chat_id, text):
     }
     send_keyboard(chat_id, text, keyboard)
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # НАСТРОЙКИ
-# =============================================
+# ──────────────────────────────────────────────────────────────
 def show_settings(chat_id, user):
-    name = user.get('character_name', 'Мини-Я')
-    morning = user.get('reminder_morning') or 'не установлено'
-    day = user.get('reminder_day') or 'не установлено'
-    evening = user.get('reminder_evening') or 'не установлено'
-    tasks = user.get('custom_tasks', [])
-    tasks_text = ""
-    if tasks:
-        for i, task in enumerate(tasks, 1):
-            tasks_text += f"{i}. {task['text']} в {task['time']}\n"
-    else:
-        tasks_text = "нет"
-    
-    text = (
-        f"⚙️ *Настройки расписания для {escape_markdown(name)}*\n\n"
-        f"🌅 Утро: {morning}\n"
-        f"☀️ День: {day}\n"
-        f"🌙 Вечер: {evening}\n\n"
-        f"📝 *Ваши задачи:*\n{tasks_text}\n\n"
-        "Выберите действие:"
-    )
+    text = "⚙️ *Настройки*\n\nВыберите раздел:"
     buttons = [
-        ["🕒 Установить утро", "🕒 Установить день"],
-        ["🕒 Установить вечер", "➕ Добавить задачу"],
-        ["🗑 Удалить задачу", "❌ Отмена"]
+        ["🕒 Напоминания"],
+        ["📝 Задачи"],
+        ["🔙 Назад"]
     ]
     keyboard = {
         'keyboard': [[{'text': btn} for btn in row] for row in buttons],
@@ -735,9 +702,74 @@ def show_settings(chat_id, user):
     }
     send_keyboard(chat_id, text, keyboard)
 
-# =============================================
+def show_reminders_settings(chat_id, user):
+    name = user.get('character_name', 'Мини-Я')
+    morning = user.get('reminder_morning') or 'не установлено'
+    day = user.get('reminder_day') or 'не установлено'
+    evening = user.get('reminder_evening') or 'не установлено'
+    text = (
+        f"🕒 *Настройки напоминаний для {escape_markdown(name)}*\n\n"
+        f"🌅 Утро: {morning}\n"
+        f"☀️ День: {day}\n"
+        f"🌙 Вечер: {evening}\n\n"
+        "Выберите, что изменить:"
+    )
+    buttons = [
+        ["🕒 Утро", "🕒 День"],
+        ["🕒 Вечер", "❌ Отмена"],
+        ["🔙 Назад"]
+    ]
+    keyboard = {
+        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
+        'resize_keyboard': True,
+        'one_time_keyboard': True
+    }
+    send_keyboard(chat_id, text, keyboard)
+
+def show_tasks_settings(chat_id, user):
+    tasks = user.get('custom_tasks', [])
+    tasks_text = ""
+    if tasks:
+        for i, task in enumerate(tasks, 1):
+            tasks_text += f"{i}. {task['text']} в {task['time']}\n"
+    else:
+        tasks_text = "нет"
+    text = (
+        f"📝 *Ваши задачи*\n\n"
+        f"{tasks_text}\n"
+        "Что хотите сделать?"
+    )
+    buttons = [
+        ["➕ Добавить задачу"],
+        ["🗑 Удалить задачу"],
+        ["🔙 Назад"]
+    ]
+    keyboard = {
+        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
+        'resize_keyboard': True,
+        'one_time_keyboard': True
+    }
+    send_keyboard(chat_id, text, keyboard)
+
+def add_task(chat_id, user_id, user, text):
+    # ожидаем текст задачи, затем время
+    save_user_field(user_id, 'temp_action', 'add_task')
+    save_user_field(user_id, 'temp_data', text)
+    send_message(chat_id, "✅ Текст задачи сохранён. Теперь введите время в формате ЧЧ:ММ (например, 14:00).")
+
+def delete_task(chat_id, user_id, user):
+    tasks = user.get('custom_tasks', [])
+    if not tasks:
+        send_message(chat_id, "У вас нет задач для удаления.")
+        show_tasks_settings(chat_id, user)
+        return
+    task_list = "\n".join([f"{i+1}. {task['text']} в {task['time']}" for i, task in enumerate(tasks)])
+    save_user_field(user_id, 'temp_action', 'delete_task')
+    send_message(chat_id, f"📝 *Ваши задачи:*\n\n{task_list}\n\nНапишите номер задачи, которую нужно удалить.")
+
+# ──────────────────────────────────────────────────────────────
 # ТЕСТ (ЛОГИКА)
-# =============================================
+# ──────────────────────────────────────────────────────────────
 def start_test(chat_id, user_id):
     save_user_field(user_id, 'test_answers', '[]')
     save_user_field(user_id, 'game_status', 'testing')
@@ -807,9 +839,10 @@ def finish_test(chat_id, user_id):
     archetype = calculate_archetype(answers)
     save_user_field(user_id, 'archetype', archetype)
     save_user_field(user_id, 'game_status', 'idle')
-    archetype_name = get_archetype_name(archetype)
-    description = ARCHETYPE_DESC.get(archetype, "Твой уникальный архетип.")
-    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{description}\n\nТеперь ты можешь:\n📋 Посмотреть расписание для своего архетипа\n🚪 Войти в Комнату и начать прокачку\n📊 Отслеживать прогресс\n\nХочешь узнать о своём архетипе больше? Нажми /archetype.")
+    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
+    short_desc = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
+    # Краткое описание
+    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{short_desc}\n\nХочешь узнать больше? Нажми /archetype для полной интерпретации.")
     show_main_menu(chat_id, "Главное меню:")
 
 def show_archetype(chat_id, user_id):
@@ -818,25 +851,21 @@ def show_archetype(chat_id, user_id):
     if not archetype:
         send_message(chat_id, "Ты ещё не проходил(а) тест. Напиши /test, чтобы начать.")
         return
-    archetype_name = get_archetype_name(archetype)
-    description = ARCHETYPE_DESC.get(archetype, "Твой уникальный архетип.")
-    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{description}")
+    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
+    full_desc = ARCHETYPE_FULL_DESC.get(archetype, "Полная интерпретация отсутствует.")
+    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{full_desc}")
 
-# =============================================
-# НОВЕЛЛА (ЛОГИКА КОМНАТЫ)
-# =============================================
+# ──────────────────────────────────────────────────────────────
+# КОМНАТА (НОВЕЛЛА)
+# ──────────────────────────────────────────────────────────────
 def handle_room(chat_id, user_id, user):
-    # Проверяем, есть ли состояние новеллы
     state = get_novel_state(user_id)
     if state is None:
         state = create_novel_state(user_id)
-    
-    # Если новелла завершена
     if state.get('completed', 0) == 1:
-        # Показываем финал
-        room_text = build_final_room(user, state)
-        send_message(chat_id, room_text)
-        # Предложение продолжения (заглушка)
+        # финал
+        text = build_final_room(user, state)
+        send_message(chat_id, text)
         keyboard = {
             'inline_keyboard': [
                 [{'text': '💎 Купить продолжение (300 руб)', 'callback_data': 'buy_continuation'}],
@@ -845,22 +874,16 @@ def handle_room(chat_id, user_id, user):
         }
         send_keyboard(chat_id, "Хочешь узнать, что было дальше?", keyboard)
         return
-    
-    # Определяем текущий эпизод
     episode_id = state.get('episode', 0) + 1
     if episode_id > 7:
-        # Все эпизоды пройдены – завершаем
         state['completed'] = 1
         save_novel_state(user_id, state)
         handle_room(chat_id, user_id, user)
         return
-    
     ep = get_episode(episode_id)
     if not ep:
         send_message(chat_id, "Ошибка: эпизод не найден.")
         return
-    
-    # Показываем эпизод
     text = f"🚪 *Эпизод {episode_id} из 7: {ep['title']}*\n\n{ep['text']}"
     buttons = []
     for idx, choice in enumerate(ep['choices']):
@@ -874,28 +897,21 @@ def handle_novel_choice(chat_id, user_id, episode_id, choice_idx):
     state = get_novel_state(user_id)
     if state is None:
         state = create_novel_state(user_id)
-    
     ep = get_episode(episode_id)
     if not ep:
         send_message(chat_id, "Ошибка: эпизод не найден.")
         return
-    
     choice = ep['choices'][choice_idx]
-    # Обновляем параметры
     params = state.get('parameters', {})
     for key, val in choice['effects'].items():
         params[key] = params.get(key, 0) + val
     state['parameters'] = params
-    # Сохраняем выборы
     choices = state.get('choices', [])
     choices.append({"episode": episode_id, "choice": choice['text']})
     state['choices'] = choices
     state['episode'] = episode_id
     save_novel_state(user_id, state)
-    
-    # Показываем нейтральный текст эпизода
     send_message(chat_id, f"🌀 *Результат*\n\n{ep['neutral']}")
-    # Переходим к следующему эпизоду
     handle_room(chat_id, user_id, get_user(user_id))
 
 def exit_novel(chat_id, user_id):
@@ -908,8 +924,8 @@ def build_final_room(user, state):
     if not archetype:
         archetype = calculate_archetype_from_params(params)
         save_user_field(user['user_id'], 'archetype', archetype)
-    archetype_name = get_archetype_name(archetype)
-    description = ARCHETYPE_DESC.get(archetype, "Твой уникальный архетип.")
+    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
+    description = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
     phrases = user.get('key_phrases', [])
     name = user.get('character_name', 'Мини-Я')
     text = (
@@ -927,9 +943,9 @@ def build_final_room(user, state):
     text += "\n✨ Ты завершил(а) путешествие! Это только начало."
     return text
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # ОСНОВНАЯ ЛОГИКА
-# =============================================
+# ──────────────────────────────────────────────────────────────
 @app.route('/')
 def index():
     return "Бот 'Мини-Ты' работает! 🤖"
@@ -948,7 +964,6 @@ def webhook():
             username = callback['from'].get('username')
             callback_data = callback['data']
             user = get_or_create_user(user_id, username)
-            
             if callback_data.startswith('novel_choice:'):
                 parts = callback_data.split(':')
                 episode_id = int(parts[1])
@@ -969,7 +984,6 @@ def webhook():
                 return 'ok', 200
             send_message(chat_id, "Команда выполнена.")
             return 'ok', 200
-        
         if data and 'message' in data:
             msg = data['message']
             chat_id = msg['chat']['id']
@@ -1001,6 +1015,7 @@ def handle_message(chat_id, user_id, user, text):
     temp_action = user.get('temp_action')
     temp_data = user.get('temp_data')
     
+    # Сброс temp_action при нажатии на кнопки навигации или "Отмена"
     nav_buttons = ["🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", 
                    "📊 Прогресс", "🧘 Практики", "⚙️ Настройки", "🔙 Назад", "❌ Отмена"]
     if text in nav_buttons and temp_action:
@@ -1073,15 +1088,16 @@ def handle_message(chat_id, user_id, user, text):
         send_message(chat_id, "Чтобы начать, нажми '🚀 Начать' или напиши имя своего Мини-Ты.")
         return
     
-    # ОБРАБОТКА FSM
+    # ОБРАБОТКА СОСТОЯНИЙ (FSM)
     if temp_action:
         if temp_action.startswith('set_'):
+            # установка времени напоминания
             if text.lower() == 'отключить':
                 field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
                 save_user_field(user_id, field, None)
                 save_user_field(user_id, 'temp_action', None)
                 send_message(chat_id, f"🔕 Напоминание отключено.")
-                show_settings(chat_id, user)
+                show_reminders_settings(chat_id, user)
                 return
             if re.match(r'^\d{1,2}:\d{2}$', text.strip()):
                 field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
@@ -1089,7 +1105,7 @@ def handle_message(chat_id, user_id, user, text):
                 save_user_field(user_id, 'temp_action', None)
                 period_name = {'set_morning': 'утро', 'set_day': 'день', 'set_evening': 'вечер'}[temp_action]
                 send_message(chat_id, f"✅ Время для {period_name} установлено на {text.strip()}")
-                show_settings(chat_id, user)
+                show_reminders_settings(chat_id, user)
                 return
             else:
                 send_message(chat_id, "❌ Неверный формат. Введи время в формате ЧЧ:ММ (например, 08:00) или 'отключить'.")
@@ -1103,7 +1119,7 @@ def handle_message(chat_id, user_id, user, text):
                     save_user_field(user_id, 'custom_tasks', tasks)
                     save_user_field(user_id, 'temp_action', None)
                     send_message(chat_id, f"✅ Задача '{removed['text']}' удалена.")
-                    show_settings(chat_id, user)
+                    show_tasks_settings(chat_id, user)
                     return
                 else:
                     send_message(chat_id, "❌ Некорректный номер задачи. Попробуй ещё раз.")
@@ -1113,6 +1129,7 @@ def handle_message(chat_id, user_id, user, text):
                 return
         elif temp_action == 'add_task':
             if not temp_data:
+                # Текст задачи уже сохранён
                 save_user_field(user_id, 'temp_data', text)
                 send_message(chat_id, "✅ Текст задачи сохранён. Теперь введи время в формате ЧЧ:ММ (например, 14:00).")
                 return
@@ -1125,7 +1142,7 @@ def handle_message(chat_id, user_id, user, text):
                     save_user_field(user_id, 'temp_action', None)
                     save_user_field(user_id, 'temp_data', None)
                     send_message(chat_id, f"✅ Задача '{task_text}' в {text.strip()} добавлена.")
-                    show_settings(chat_id, user)
+                    show_tasks_settings(chat_id, user)
                     return
                 else:
                     send_message(chat_id, "❌ Неверный формат времени. Напиши ЧЧ:ММ (например, 14:00).")
@@ -1146,16 +1163,7 @@ def handle_message(chat_id, user_id, user, text):
         elif text == '/archetype':
             show_archetype(chat_id, user_id)
         elif text == '/room':
-            # Если есть состояние новеллы или game_day > 0, открываем комнату
-            state = get_novel_state(user_id)
-            if state:
-                handle_room(chat_id, user_id, user)
-            elif user.get('game_day', 0) > 0:
-                # Старая комната – предлагаем начать новую
-                send_message(chat_id, "У тебя есть незавершённая старая Комната. Хочешь начать новую историю? (старые данные сохранятся)")
-                show_main_menu(chat_id, "Главное меню:", waiting=waiting)
-            else:
-                handle_room(chat_id, user_id, user)
+            handle_room(chat_id, user_id, user)
         elif text == '/menu':
             show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
         else:
@@ -1170,20 +1178,23 @@ def handle_message(chat_id, user_id, user, text):
         show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
         return
     if text == "🧠 Мой Архетип":
-        if user.get('archetype'):
-            show_archetype(chat_id, user_id)
-        else:
-            send_message(chat_id, "🧠 Ты ещё не проходил(а) тест.\nНажми /test, чтобы узнать свой архетип.")
+        show_archetype(chat_id, user_id)
         return
     if text == "📋 Расписание":
         archetype = user.get('archetype')
         if archetype:
             sched = get_schedule(archetype)
-            name_archetype = get_archetype_name(archetype)
+            name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
             static_text = f"📋 *Расписание для архетипа «{name_archetype}»*\n\n"
             for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
                 title, practice, affirmation = sched[period]
                 static_text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
+            # Добавляем задачи пользователя, если они есть
+            tasks = user.get('custom_tasks', [])
+            if tasks:
+                static_text += "📝 *Ваши задачи:*\n"
+                for task in tasks:
+                    static_text += f"• {task['text']} (в {task['time']})\n"
             buttons = [["🔙 Назад"]]
             if waiting:
                 buttons.append(["✅ Выполнил(а) практику"])
@@ -1197,24 +1208,12 @@ def handle_message(chat_id, user_id, user, text):
             send_message(chat_id, "Сначала определи свой архетип через 🧠 Мой Архетип")
         return
     if text == "🚪 Комната":
-        if user.get('character_name') == 'Мини-Я':
-            send_message(chat_id, "Сначала зарегистрируйся через /start и дай имя своему Мини-Ты.")
-            show_main_menu(chat_id, "Главное меню:", waiting=waiting)
-            return
-        state = get_novel_state(user_id)
-        if state:
-            handle_room(chat_id, user_id, user)
-            return
-        else:
-            # Создаём новое состояние и запускаем новеллу
-            create_novel_state(user_id)
-            handle_room(chat_id, user_id, user)
+        handle_room(chat_id, user_id, user)
         return
     if text == "📊 Прогресс":
         archetype = user.get('archetype')
-        archetype_name = get_archetype_name(archetype) if archetype else 'не определён'
+        archetype_name = ARCHETYPE_NAMES.get(archetype, 'не определён') if archetype else 'не определён'
         phrases = user.get('key_phrases', [])
-        day = user.get('game_day', 0)
         state = get_novel_state(user_id)
         episode = state.get('episode', 0) if state else 0
         completed = state.get('completed', 0) if state else 0
@@ -1248,24 +1247,45 @@ def handle_message(chat_id, user_id, user, text):
         show_submenu(chat_id, "Выбери действие:")
         return
     if text == "🧘 Практики":
-        # Показываем список практик (заглушка – в будущем можно добавить свои)
-        send_message(chat_id, "🧘 *Практики*\n\nСкоро здесь будет список твоих практик. А пока — расписание уже доступно в 📋 Расписание.")
-        show_submenu(chat_id, "Выбери действие:")
+        archetype = user.get('archetype')
+        if archetype:
+            sched = get_schedule(archetype)
+            name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
+            text = f"🧘 *Практики для архетипа «{name_archetype}»*\n\n"
+            for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
+                title, practice, affirmation = sched[period]
+                text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
+            # Пользовательские практики (если есть)
+            custom_practices = user.get('custom_practices', [])
+            if custom_practices:
+                text += "✏️ *Ваши практики:*\n"
+                for cp in custom_practices:
+                    text += f"• {cp}\n"
+            text += "\nЧтобы добавить свою практику, напишите в чат: 'Добавить практику: <текст>'"
+            show_submenu(chat_id, text)
+        else:
+            send_message(chat_id, "Сначала определи свой архетип.")
         return
     if text == "⚙️ Настройки":
         show_settings(chat_id, user)
         return
     
-    # Кнопки настроек
-    if text == "🕒 Установить утро":
+    # Обработка кнопок внутри настроек
+    if text == "🕒 Напоминания":
+        show_reminders_settings(chat_id, user)
+        return
+    if text == "📝 Задачи":
+        show_tasks_settings(chat_id, user)
+        return
+    if text == "🕒 Утро":
         save_user_field(user_id, 'temp_action', 'set_morning')
         send_message(chat_id, "Введи время для утренней практики в формате ЧЧ:ММ (например, 08:00) или 'отключить'.")
         return
-    if text == "🕒 Установить день":
+    if text == "🕒 День":
         save_user_field(user_id, 'temp_action', 'set_day')
         send_message(chat_id, "Введи время для дневной практики в формате ЧЧ:ММ (например, 13:00) или 'отключить'.")
         return
-    if text == "🕒 Установить вечер":
+    if text == "🕒 Вечер":
         save_user_field(user_id, 'temp_action', 'set_evening')
         send_message(chat_id, "Введи время для вечерней практики в формате ЧЧ:ММ (например, 21:00) или 'отключить'.")
         return
@@ -1275,17 +1295,16 @@ def handle_message(chat_id, user_id, user, text):
         send_message(chat_id, "Введи текст задачи (без времени). Затем я попрошу указать время.")
         return
     if text == "🗑 Удалить задачу":
-        tasks = user.get('custom_tasks', [])
-        if not tasks:
-            send_message(chat_id, "У тебя нет добавленных задач.")
-            show_settings(chat_id, user)
-            return
-        task_list = "\n".join([f"{i+1}. {task['text']} в {task['time']}" for i, task in enumerate(tasks)])
-        save_user_field(user_id, 'temp_action', 'delete_task')
-        send_message(chat_id, f"📝 *Ваши задачи:*\n\n{task_list}\n\nНапиши номер задачи, которую нужно удалить.")
+        delete_task(chat_id, user_id, user)
+        return
+    if text == "❌ Отмена":
+        # Просто сбрасываем и возвращаемся в настройки
+        save_user_field(user_id, 'temp_action', None)
+        save_user_field(user_id, 'temp_data', None)
+        show_settings(chat_id, user)
         return
     
-    # Кнопка выполнения практики
+    # Обработка выполнения практики
     if text and text.strip().startswith("✅") and "практику" in text.strip().lower():
         logging.info(f"Нажата кнопка практики, waiting={waiting}, day={day}")
         if waiting:
@@ -1306,7 +1325,9 @@ def handle_message(chat_id, user_id, user, text):
                 if can_proceed:
                     save_user_field(user_id, 'game_day', next_day)
                     save_user_field(user_id, 'game_status', 'active')
-                    # Показываем старый вопрос дня
+                    # Показываем старый вопрос дня (для обратной совместимости)
+                    # В новой версии мы используем новеллу, поэтому этот код почти не используется,
+                    # но оставляем для совместимости.
                     from GAME_DAYS import get_game_day, show_game_question
                     show_game_question(chat_id, user_id, next_day)
                 else:
@@ -1330,7 +1351,20 @@ def handle_message(chat_id, user_id, user, text):
         handle_test_answer(chat_id, user_id, user, text)
         return
     
-    # Неизвестный текст – сохраняем как фразу
+    # Если текст начинается с "Добавить практику:", сохраняем как пользовательскую практику
+    if text.lower().startswith('добавить практику:'):
+        practice_text = text[len('Добавить практику:'):].strip()
+        if practice_text:
+            custom_practices = user.get('custom_practices', [])
+            custom_practices.append(practice_text)
+            save_user_field(user_id, 'custom_practices', custom_practices)
+            send_message(chat_id, "✅ Практика добавлена!")
+        else:
+            send_message(chat_id, "❌ Не указан текст практики.")
+        show_main_menu(chat_id, "Главное меню:", waiting=waiting)
+        return
+    
+    # Неизвестный текст – сохраняем как фразу (если не "Отмена" и не пусто)
     if text:
         phrase = extract_key_phrase(text)
         phrases = user.get('key_phrases', [])
@@ -1342,9 +1376,9 @@ def handle_message(chat_id, user_id, user, text):
         send_message(chat_id, "Используй кнопки меню 👇")
         show_main_menu(chat_id, "Главное меню:", waiting=waiting)
 
-# =============================================
+# ──────────────────────────────────────────────────────────────
 # СТАРАЯ ЛОГИКА КОМНАТЫ (для обратной совместимости)
-# =============================================
+# ──────────────────────────────────────────────────────────────
 GAME_DAYS = {
     1: {
         "title": "Первый шаг",
@@ -1423,71 +1457,54 @@ def handle_game_answer(chat_id, user_id, user, text):
         send_message(chat_id, f"✅ *День {day} завершён!*\n\n{day_data['response']}\n\n📅 *Завтра — День {next_day}.*\nЧтобы открыть следующий день, выполни практику из расписания и нажми '✅ Выполнил(а) практику'.\nНовый день откроется только завтра.")
     show_main_menu(chat_id, "Главное меню:", waiting=True)
 
-# =============================================
-# CRON для напоминаний
-# =============================================
-@app.route('/cron', methods=['GET'])
-def cron():
-    key = request.args.get('key')
-    if key != CRON_KEY:
-        logging.warning(f"Cron: неверный ключ {key}")
-        return "Forbidden", 403
-    try:
-        if TZ:
-            now = datetime.now(TZ)
-        else:
-            now = datetime.now()
-        current_time = now.strftime("%H:%M")
-        logging.info(f"Cron вызван в {current_time}")
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT * FROM users").fetchall()
-        conn.close()
-        for row in rows:
-            user = dict(row)
-            user_id = user['user_id']
-            chat_id = user_id
-            archetype = user.get('archetype')
-            if not archetype:
-                continue
-            # Напоминания по расписанию
-            for period, field in [("morning", "reminder_morning"), ("day", "reminder_day"), ("evening", "reminder_evening")]:
-                reminder_time = user.get(field)
-                if reminder_time and reminder_time == current_time:
-                    title, practice, affirmation = get_practice_text(archetype, period)
-                    if title:
-                        emoji = {"morning": "🌅", "day": "☀️", "evening": "🌙"}[period]
-                        send_message(chat_id,
-                            f"{emoji} *{title}*\n\n"
-                            f"📌 {practice}\n\n"
-                            f"💬 _{affirmation}_"
-                        )
-            # Добавленные задачи
-            custom_tasks_raw = user.get('custom_tasks', '[]')
-            custom_tasks = []
-            if custom_tasks_raw:
-                if isinstance(custom_tasks_raw, str):
-                    try:
-                        custom_tasks = json.loads(custom_tasks_raw)
-                    except json.JSONDecodeError as e:
-                        logging.error(f"Ошибка парсинга custom_tasks для user {user_id}: {e}, значение: {custom_tasks_raw}")
-                        custom_tasks = []
-                elif isinstance(custom_tasks_raw, list):
-                    custom_tasks = custom_tasks_raw
-                else:
-                    logging.warning(f"custom_tasks для user {user_id} имеет неожиданный тип: {type(custom_tasks_raw)}")
-            for task in custom_tasks:
-                if task.get('time') == current_time:
-                    task_text = task.get('text', 'Напоминание')
-                    send_message(chat_id, f"⏰ *Напоминание*\n\n{task_text}")
-        return "OK", 200
-    except Exception as e:
-        logging.error(f"Cron error: {e}", exc_info=True)
-        return "Error", 500
+# ──────────────────────────────────────────────────────────────
+# ПЛАНИРОВЩИК НАПОМИНАНИЙ (ВНУТРЕННИЙ)
+# ──────────────────────────────────────────────────────────────
+def reminder_worker():
+    while True:
+        try:
+            now = datetime.now(TZ) if TZ else datetime.now()
+            current_time = now.strftime("%H:%M")
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute("SELECT * FROM users").fetchall()
+            conn.close()
+            for row in rows:
+                user = dict(row)
+                user_id = user['user_id']
+                chat_id = user_id
+                archetype = user.get('archetype')
+                if not archetype:
+                    continue
+                # Проверяем время напоминаний
+                for period, field in [("morning", "reminder_morning"), ("day", "reminder_day"), ("evening", "reminder_evening")]:
+                    reminder_time = user.get(field)
+                    if reminder_time and reminder_time == current_time:
+                        title, practice, affirmation = get_practice_text(archetype, period)
+                        if title:
+                            emoji = {"morning": "🌅", "day": "☀️", "evening": "🌙"}[period]
+                            send_message(chat_id,
+                                f"{emoji} *{title}*\n\n"
+                                f"📌 {practice}\n\n"
+                                f"💬 _{affirmation}_"
+                            )
+                # Проверяем задачи
+                custom_tasks = json.loads(user.get('custom_tasks', '[]'))
+                for task in custom_tasks:
+                    if task.get('time') == current_time:
+                        send_message(chat_id, f"⏰ *Напоминание*\n\n{task['text']}")
+            time.sleep(60)
+        except Exception as e:
+            logging.error(f"Reminder worker error: {e}")
+            time.sleep(60)
 
-# =============================================
+# Запускаем поток планировщика
+thread = threading.Thread(target=reminder_worker, daemon=True)
+thread.start()
+
+# ──────────────────────────────────────────────────────────────
 # ЗАПУСК
-# =============================================
+# ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get('PORT', 8000))
