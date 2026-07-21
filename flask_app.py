@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 import os
 import json
-import sqlite3
 import logging
 import re
 import time
 import threading
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from flask import Flask, request
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 app = Flask(__name__)
 
@@ -16,624 +20,639 @@ TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 if not TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN is not set")
 
-CRON_KEY = os.environ.get('CRON_KEY', 'my_secret_key_123')
-
-try:
-    from zoneinfo import ZoneInfo
-    TZ = ZoneInfo(os.environ.get('TIMEZONE', 'Europe/Moscow'))
-except ImportError:
-    TZ = None
-    logging.warning("zoneinfo not available, using UTC")
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 0))
+USER_ID = int(os.environ.get('USER_ID', 0))
+TIMEZONE = os.environ.get('TIMEZONE', 'Europe/Moscow')
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set")
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "anchor.db")
+# ---------- Подключение к БД ----------
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            character_name TEXT DEFAULT 'Мини-Я',
-            archetype TEXT,
-            quick_type TEXT,
-            primary_type TEXT,
-            game_status TEXT DEFAULT 'not_started',
-            test_answers TEXT DEFAULT '[]',
-            game_day INTEGER DEFAULT 0,
-            game_answers TEXT DEFAULT '[]',
-            key_phrases TEXT DEFAULT '[]',
-            waiting_for_practice INTEGER DEFAULT 0,
-            practice_done INTEGER DEFAULT 0,
-            last_day_completed_date TEXT,
-            reminder_morning TEXT,
-            reminder_day TEXT,
-            reminder_evening TEXT,
-            custom_tasks TEXT DEFAULT '[]',
-            custom_practices TEXT DEFAULT '[]',
-            temp_action TEXT,
-            temp_data TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
-        )
-    ''')
-    # Таблица новеллы
-    conn.execute('''
-        CREATE TABLE IF NOT EXISTS novel_state (
-            user_id INTEGER PRIMARY KEY,
-            episode INTEGER DEFAULT 0,
-            choices TEXT DEFAULT '[]',
-            parameters TEXT DEFAULT '{}',
-            completed INTEGER DEFAULT 0,
-            paid INTEGER DEFAULT 0,
-            updated_at TEXT DEFAULT (datetime('now'))
-        )
-    ''')
-    # Миграция: копируем quick_type и primary_type в archetype, если поле archetype пустое
-    conn.execute("UPDATE users SET archetype = quick_type WHERE archetype IS NULL AND quick_type IS NOT NULL")
-    conn.execute("UPDATE users SET archetype = primary_type WHERE archetype IS NULL AND primary_type IS NOT NULL")
-    conn.commit()
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                name TEXT DEFAULT 'Армен',
+                archetype_profile TEXT DEFAULT '{}',
+                practice_progress TEXT DEFAULT '{}',
+                stats TEXT DEFAULT '{}',
+                paused BOOLEAN DEFAULT FALSE,
+                joined TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS reports (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                report_type TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id BIGINT PRIMARY KEY,
+                morning_time TEXT DEFAULT '06:30',
+                evening_time TEXT DEFAULT '23:00',
+                sunday_reflection_time TEXT DEFAULT '09:00',
+                monday_alert_time TEXT DEFAULT '21:00'
+            )
+        ''')
+        conn.commit()
     conn.close()
 
+# !!! ВАЖНО: вызываем init_db() при загрузке приложения
+init_db()
+
+# ---------- АРХЕТИПЫ (16) ----------
+ARCHETYPES = {
+    "Искатель": {
+        "ennea": "5+7",
+        "center": "Голова",
+        "fear": "Быть беспомощным, застрять",
+        "desire": "Быть компетентным, свободным",
+        "stress": "→ 7 (рассеянность)",
+        "integration": "→ 8 (действие)",
+        "strength": "Исследование, кросс-поллинизация, адаптация",
+        "shadow": "Незавершённость, бегство от глубины",
+        "rule": "Путь — не оправдание бегства. Завершённость — тоже опыт.",
+    },
+    "Маг": {
+        "ennea": "5+1",
+        "center": "Голова + Тело",
+        "fear": "Быть неспособным, ошибиться",
+        "desire": "Быть компетентным, обладающим ключом",
+        "stress": "→ 7 (рассеянность)",
+        "integration": "→ 8 (деление)",
+        "strength": "Аналитика, перевод между мирами, трансформация",
+        "shadow": "Изоляция, манипуляция знанием",
+        "rule": "Знание — не власть. Знание — ответственность делиться.",
+    },
+    "Простодушный": {
+        "ennea": "9+2",
+        "center": "Тело + Сердце",
+        "fear": "Быть отвергнутым, в конфликте",
+        "desire": "Быть в гармонии, нужным",
+        "stress": "→ 6 (тревога)",
+        "integration": "→ 3 (действие)",
+        "strength": "Создание комфорта, медиация, присутствие",
+        "shadow": "Пассивность, потеря себя в угождении",
+        "rule": "Доверие — не отказ от выбора. Комфорт — не цель.",
+    },
+    "Любовник": {
+        "ennea": "4+2",
+        "center": "Сердце",
+        "fear": "Быть обычным, отвергнутым",
+        "desire": "Быть уникальным, любимым за себя",
+        "stress": "→ 2 (поглощение)",
+        "integration": "→ 1 (целостность)",
+        "strength": "Искусство, эмпатия, полное присутствие",
+        "shadow": "Зависимость от связи, иллюзия идеального",
+        "rule": "Связь — не слияние. Красота — не оправдание.",
+    },
+    "Дирижёр": {
+        "ennea": "1+8",
+        "center": "Тело",
+        "fear": "Быть плохим, хаос, потеря контроля",
+        "desire": "Быть правым, сильным, порядок везде",
+        "stress": "→ 4 (меланхолия)",
+        "integration": "→ 7 (радость, отпускание)",
+        "strength": "Самоуправление, лидерство, системное мышление",
+        "shadow": "Переконтроль, перфекционизм, выгорание",
+        "rule": "Контролируй то, что усиливает жизнь. Отпускай остальное.",
+    },
+    "Правитель": {
+        "ennea": "8+1",
+        "center": "Тело",
+        "fear": "Быть уязвимым, контролируемым",
+        "desire": "Быть сильным, защищённым, правым",
+        "stress": "→ 5 (отстранение)",
+        "integration": "→ 2 (нежность)",
+        "strength": "Создание систем, защита слабых, лидерство",
+        "shadow": "Ригидность, тирания во благо",
+        "rule": "Правила — не стены. Это опоры. Власть — служение.",
+    },
+    "Мудрец": {
+        "ennea": "5+9",
+        "center": "Голова + Тело",
+        "fear": "Быть беспомощным, поглощённым",
+        "desire": "Быть компетентным, целым",
+        "stress": "→ 7 (рассеянность)",
+        "integration": "→ 8 (действие)",
+        "strength": "Аналитика, консультирование, философия",
+        "shadow": "Отстранённость, анализ как прокрастинация",
+        "rule": "Знание без действия — бесплодно. Ты тоже часть картины.",
+    },
+    "Воин": {
+        "ennea": "8+6",
+        "center": "Тело + Голова",
+        "fear": "Быть уязвимым, преданным, беззащитным",
+        "desire": "Быть сильным, в безопасности",
+        "stress": "→ 5 (отстранение)",
+        "integration": "→ 2 (нежность)",
+        "strength": "Защита слабых, дисциплина, преодоление",
+        "shadow": "Гипер-независимость, война как норма",
+        "rule": "Просить помощь — не слабость. Не каждый конфликт — битва.",
+    },
+    "Заботливый": {
+        "ennea": "2+9",
+        "center": "Сердце + Тело",
+        "fear": "Быть ненужным, отвергнутым",
+        "desire": "Быть нужным, любимым, в гармонии",
+        "stress": "→ 8 (контроль)",
+        "integration": "→ 4 (аутентичность)",
+        "strength": "Терапия, образование, лидерство через заботу",
+        "shadow": "Жертва как идентичность, истощение",
+        "rule": "Забота — не контракт. Ты не обязан питать всех.",
+    },
+    "Герой": {
+        "ennea": "8+3",
+        "center": "Тело + Сердце",
+        "fear": "Быть слабым, бесполезным, неудачником",
+        "desire": "Быть сильным, успешным, значимым",
+        "stress": "→ 5 (отстранение)",
+        "integration": "→ 2 (нежность)",
+        "strength": "Активизм, лидерство в кризисе, вдохновение",
+        "shadow": "Спасательство как зависимость, жертва как гордость",
+        "rule": "Не каждый кризис — твой. Обычность — тоже подвиг.",
+    },
+    "Бунтарь": {
+        "ennea": "8+4",
+        "center": "Тело + Сердце",
+        "fear": "Быть контролируемым, обычным, поглощённым",
+        "desire": "Быть свободным, уникальным, сильным",
+        "stress": "→ 5 (отстранение)",
+        "integration": "→ 2 (нежность)",
+        "strength": "Революция, честность радикальная, освобождение",
+        "shadow": "Бунт ради бунта, разрушение без создания",
+        "rule": "Не все правила — оковы. Разрушай, но предлагай.",
+    },
+    "Странник": {
+        "ennea": "5+4",
+        "center": "Голова + Сердце",
+        "fear": "Быть поглощённым, беспомощным, обычным",
+        "desire": "Быть компетентным, уникальным, свободным",
+        "stress": "→ 7 (рассеянность)",
+        "integration": "→ 8 (действие)",
+        "strength": "Аналитика, творчество, автономия",
+        "shadow": "Уход как привычка, отчуждение",
+        "rule": "Дистанция — не стена. Уязвимость — не зависимость.",
+    },
+    "Шут": {
+        "ennea": "7+2",
+        "center": "Голова + Сердце",
+        "fear": "Быть в боли, ограниченным, ненужным",
+        "desire": "Быть довольным, свободным, нужным",
+        "stress": "→ 1 (критика)",
+        "integration": "→ 5 (глубина)",
+        "strength": "Разряжение напряжения, правда через игру",
+        "shadow": "Ирония как бегство, несерьёзность как защита",
+        "rule": "Юмор — не отрицание. Иногда нужно сказать прямо.",
+    },
+    "Учитель": {
+        "ennea": "2+5",
+        "center": "Сердце + Голова",
+        "fear": "Быть ненужным, неспособным",
+        "desire": "Быть нужным, компетентным, полезным",
+        "stress": "→ 8 (контроль)",
+        "integration": "→ 4 (аутентичность)",
+        "strength": "Образование, коучинг, лидерство через рост",
+        "shadow": "Нужда в учениках, жертва ради роста других",
+        "rule": "Ученики — не твои. Ты тоже ученик. Всегда.",
+    },
+    "Дипломат": {
+        "ennea": "9+6",
+        "center": "Тело + Голова",
+        "fear": "Быть разделённым, преданным, в конфликте",
+        "desire": "Быть в гармонии, в безопасности, целым",
+        "stress": "→ 3 (погоня)",
+        "integration": "→ 3 (действие)",
+        "strength": "Медиация, перевод между мирами, гармония",
+        "shadow": "Потеря себя в балансе, компромисс ради компромисса",
+        "rule": "Не каждый конфликт нужно решать. Иногда нужно выбрать.",
+    },
+}
+
+METAPHORS = {
+    "Искатель": "путь",
+    "Маг": "мост",
+    "Простодушный": "тёплый очаг",
+    "Любовник": "связь",
+    "Дирижёр": "оркестр",
+    "Правитель": "крепость",
+    "Мудрец": "светильник",
+    "Воин": "щит",
+    "Заботливый": "сад",
+    "Герой": "огонь",
+    "Бунтарь": "ветер",
+    "Странник": "горизонт",
+    "Шут": "зеркало",
+    "Учитель": "мост знаний",
+    "Дипломат": "перевод",
+}
+
+AFFIRMATIONS_BY_CORE = {
+    "Искатель": "Я — путь. Каждый шаг — это уже прибытие.",
+    "Маг": "Я — мост. Я соединяю то, что казалось разделённым.",
+    "Простодушный": "Я — тепло. Я позволяю миру быть мягким, и это моя сила.",
+    "Любовник": "Я — связь. Я вижу красоту там, где другие видят обыденность.",
+    "Дирижёр": "Я легко беру контроль там, где это приносит пользу.",
+    "Правитель": "Я — опора. Я создаю пространство, где все могут расти.",
+    "Мудрец": "Я — свет. Я вижу то, что скрыто.",
+    "Воин": "Я — щит. Я защищаю то, что важно.",
+    "Заботливый": "Я — сад. Я даю рост другим, но и сама расту.",
+    "Герой": "Я — огонь. Я горю ради того, во что верю. Но я не сгораю.",
+    "Бунтарь": "Я — ветер. Я сдуваю мёртвое, чтобы освободить место для живого.",
+    "Странник": "Я — горизонт. Я вижу дальше, потому что не привязан.",
+    "Шут": "Я — зеркало. Я отражаю абсурд, чтобы он стал видимым.",
+    "Учитель": "Я — мост. Я соединяю то, что знаю, с тем, кто идёт.",
+    "Дипломат": "Я — перевод. Я нахожу язык, на котором все слышат друг друга.",
+}
+
+MAP_QUESTIONS = [
+    {
+        "id": "crisis_response",
+        "text": "Когда всё рушится, твой первый импульс?",
+        "options": [
+            {"label": "Найти выход. Построить мост.", "archetypes": ["Искатель", "Дипломат"]},
+            {"label": "Взять контроль. Восстановить порядок.", "archetypes": ["Дирижёр", "Правитель"]},
+            {"label": "Уйти. Наблюдать. Понять, что происходит.", "archetypes": ["Маг", "Мудрец", "Странник"]},
+            {"label": "Защитить тех, кто слабее.", "archetypes": ["Воин", "Герой"]},
+            {"label": "Создать комфорт. Сохранить тепло.", "archetypes": ["Простодушный", "Заботливый"]},
+            {"label": "Показать, что это абсурд. Разрядить.", "archetypes": ["Шут", "Бунтарь"]},
+            {"label": "Углубиться в чувство. Найти красоту в разрушении.", "archetypes": ["Любовник"]},
+            {"label": "Найти, чему научиться. Передать другим.", "archetypes": ["Учитель"]},
+        ],
+    },
+    {
+        "id": "home_definition",
+        "text": "Что для тебя — «дом»?",
+        "options": [
+            {"label": "Место, где я свободен идти.", "archetypes": ["Искатель", "Странник"]},
+            {"label": "Место, где всё на своих местах.", "archetypes": ["Дирижёр", "Правитель"]},
+            {"label": "Место, где меня понимают без слов.", "archetypes": ["Маг", "Мудрец"]},
+            {"label": "Место, где все в безопасности.", "archetypes": ["Воин", "Заботливый"]},
+            {"label": "Место, где тепло и можно просто быть.", "archetypes": ["Простодушный", "Любовник"]},
+            {"label": "Место, где смеются над важным.", "archetypes": ["Шут", "Бунтарь"]},
+            {"label": "Место, где растут.", "archetypes": ["Учитель", "Герой"]},
+            {"label": "Место, где все слышат друг друга.", "archetypes": ["Дипломат"]},
+        ],
+    },
+    {
+        "id": "hidden_shadow",
+        "text": "Твоя тень — что ты скрываешь даже от себя?",
+        "options": [
+            {"label": "Я бегу, прежде чем останусь.", "archetypes": ["Искатель", "Странник"]},
+            {"label": "Я ломаю, прежде чем построю.", "archetypes": ["Бунтарь", "Воин"]},
+            {"label": "Я контролирую, потому что боюсь хаоса внутри.", "archetypes": ["Дирижёр", "Правитель"]},
+            {"label": "Я знаю всё, но не действую.", "archetypes": ["Маг", "Мудрец"]},
+            {"label": "Я отдаю, чтобы не чувствовать пустоту.", "archetypes": ["Заботливый", "Учитель"]},
+            {"label": "Я сглаживаю, чтобы не выбирать.", "archetypes": ["Дипломат", "Простодушный"]},
+            {"label": "Я смеюсь, чтобы не плакать.", "archetypes": ["Шут", "Любовник"]},
+            {"label": "Я спасаю, чтобы не быть обычным.", "archetypes": ["Герой", "Воин"]},
+        ],
+    },
+]
+
+PRACTICES = [
+    {"id": "P-1", "name": "Дыхание", "category": "morning", "when": "Утро", "duration": "3 мин",
+     "text": "Сядь прямо. Сделай 5 глубоких вдохов. На выдохе представляй, как уходит напряжение.", "key": "дыхание",
+     "schedule_time": "06:30", "schedule_days": [0,1,2,3,4,5,6]},
+    {"id": "P-2", "name": "Утренняя установка", "category": "morning", "when": "Утро", "duration": "2 мин",
+     "text": "Спроси себя: что я хочу увидеть вечером? Запиши одну мысль.", "key": "утренняя_установка",
+     "schedule_time": "08:00", "schedule_days": [0,1,2,3,4,5,6]},
+    {"id": "P-3", "name": "Аффирмация", "category": "morning", "when": "Утро", "duration": "1 мин",
+     "text": "Прочти аффирмацию. Просто прочти. Не обязан отвечать.", "key": "аффирмация",
+     "schedule_time": "10:30", "schedule_days": [0,1,2,3,4,5,6]},
+    {"id": "P-4", "name": "Вечерний мини-отчёт", "category": "evening", "when": "Вечер", "duration": "5 мин",
+     "text": "Напиши три строки:\n1. Что я контролировал сегодня?\n2. Был хозяином дня или пожарным?\n3. Что оставляю за дверью?", "key": "вечерний_мини_отчёт",
+     "schedule_time": "22:00", "schedule_days": [0,1,2,3,4]},
+]
+
+BLOCKS = [
+    {"id": "N-1", "text": "Твоё Второе Я — единственный на сцене, кто держит тишину между нотами."},
+    {"id": "N-2", "text": "Ты не должен быть всем — ты должен быть собой. Это уже достаточно."},
+    {"id": "N-3", "text": "Позволь себе быть несовершенным сегодня. Это не поражение, это дыхание."},
+    {"id": "N-4", "text": "Ты — {metaphor}. Ты не боишься хаоса, ты знаешь, что из него рождается порядок."},
+    {"id": "N-5", "text": "Твоя сила — {core}. Твоя тень — {shadow}. Интеграция — это когда ты позволяешь им быть."},
+    {"id": "N-6", "text": "Сегодня ты был(а) хозяином дня. Завтра тоже будешь."},
+    {"id": "N-7", "text": "Оставь за дверью то, что не служит твоему росту. Дверь закрывается тихо."},
+    {"id": "N-8", "text": "Ты — путь. Каждый шаг — уже прибытие. Остановись и почувствуй, где ты сейчас."},
+    {"id": "N-9", "text": "Мудрость — не в том, чтобы знать всё, а в том, чтобы быть с тем, что есть."},
+    {"id": "N-10", "text": "Ты — огонь. Ты горишь, но не сгораешь. Это твоя суперсила."},
+]
+
+# ---------- ФУНКЦИИ ----------
 def get_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
     conn.close()
     if row is None:
         return None
     user = dict(row)
-    user['test_answers'] = json.loads(user['test_answers'] or '[]')
-    user['game_answers'] = json.loads(user['game_answers'] or '[]')
-    user['key_phrases'] = json.loads(user['key_phrases'] or '[]')
-    user['custom_tasks'] = json.loads(user['custom_tasks'] or '[]')
-    user['custom_practices'] = json.loads(user['custom_practices'] or '[]')
+    user['archetype_profile'] = json.loads(user['archetype_profile'] or '{}')
+    user['practice_progress'] = json.loads(user['practice_progress'] or '{}')
+    user['stats'] = json.loads(user['stats'] or '{}')
     return user
 
-def get_or_create_user(user_id, username=None):
+def get_or_create_user(user_id, username=None, name=None):
     init_db()
     user = get_user(user_id)
     if user is None:
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)",
-            (user_id, username)
-        )
-        conn.commit()
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO users (user_id, username, name) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id, username, name or 'Армен')
+            )
+            conn.commit()
         conn.close()
         user = get_user(user_id)
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_settings (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id,)
+            )
+            conn.commit()
+        conn.close()
     return user
 
 def save_user_field(user_id, field, value):
-    conn = sqlite3.connect(DB_PATH)
-    if isinstance(value, (list, dict)):
-        value = json.dumps(value, ensure_ascii=False)
-    conn.execute(f"UPDATE users SET {field} = ? WHERE user_id = ?", (value, user_id))
-    conn.commit()
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        cur.execute(f"UPDATE users SET {field} = %s WHERE user_id = %s", (value, user_id))
+        conn.commit()
     conn.close()
 
-def delete_user(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
-    conn.commit()
+def get_user_setting(user_id, setting_key, default=None):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT * FROM user_settings WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
     conn.close()
-    logging.info(f"User {user_id} deleted")
+    if row:
+        return row.get(setting_key, default)
+    return default
 
-# ──────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ АРХЕТИПА (с fallback)
-# ──────────────────────────────────────────────────────────────
-def get_user_archetype(user):
-    """Возвращает архетип пользователя из любого доступного поля."""
-    return user.get('archetype') or user.get('quick_type') or user.get('primary_type')
+def save_report(user_id, report_type, content):
+    conn = get_db_connection()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO reports (user_id, report_type, content) VALUES (%s, %s, %s)",
+            (user_id, report_type, content)
+        )
+        conn.commit()
+    conn.close()
 
-# ──────────────────────────────────────────────────────────────
-# НОВЕЛЛА (7 эпизодов)
-# ──────────────────────────────────────────────────────────────
-NOVEL_EPISODES = [
-    {
-        "id": 1,
-        "title": "Комната с зеркалом",
-        "text": "Ты стоишь в пустой комнате. Единственный предмет — большое зеркало в старинной раме. Ты подходишь ближе и видишь в нём не своё отражение, а незнакомца — он смотрит на тебя с любопытством.",
-        "choices": [
-            {"text": "Подойти вплотную и дотронуться до стекла.", "effects": {"contact": 2, "courage": 1}},
-            {"text": "Отступить и осмотреть комнату в поисках других предметов.", "effects": {"observation": 2, "caution": 1}},
-            {"text": "Заговорить с отражением, спросить, кто оно.", "effects": {"communication": 2, "empathy": 1}}
-        ],
-        "neutral": "Ты чувствуешь, как комната наполняется тишиной. Отражение улыбается, и ты понимаешь: это не просто комната — это начало пути."
-    },
-    {
-        "id": 2,
-        "title": "Карта на стене",
-        "text": "В углу комнаты ты замечаешь старую карту, приколотую к стене. На ней изображены разные места: гора, лес, море, город. Все они связаны тонкими линиями.",
-        "choices": [
-            {"text": "Рассмотреть карту в деталях, запомнить все пути.", "effects": {"strategy": 2, "observation": 1}},
-            {"text": "Выбрать одно место — гору — и представить себя там.", "effects": {"imagination": 2, "courage": 1}},
-            {"text": "Позвать кого-то, кто мог бы объяснить карту.", "effects": {"communication": 1, "trust": 2}}
-        ],
-        "neutral": "Карта словно оживает: линии начинают двигаться, и ты понимаешь, что это не просто карта — это схема твоей жизни."
-    },
-    {
-        "id": 3,
-        "title": "Сундук в углу",
-        "text": "В углу комнаты стоит старый деревянный сундук. На крышке вырезаны символы: солнце, луна, звезда. Сундук закрыт, но ты чувствуешь, что он хранит что-то важное.",
-        "choices": [
-            {"text": "Попытаться открыть сундук силой.", "effects": {"force": 2, "courage": 1}},
-            {"text": "Изучить символы и попробовать отгадать код.", "effects": {"logic": 2, "observation": 1}},
-            {"text": "Постучать по сундуку и спросить, кто внутри.", "effects": {"communication": 1, "empathy": 2}}
-        ],
-        "neutral": "Сундук тихо скрипит, словно отвечая. Ты понимаешь, что внутри — не вещи, а твои собственные страхи и надежды."
-    },
-    {
-        "id": 4,
-        "title": "Дверь в сад",
-        "text": "За одним из углов комнаты ты видишь неприметную дверь, ведущую в сад. Из-за неё доносится звук воды и пение птиц.",
-        "choices": [
-            {"text": "Открыть дверь и войти в сад.", "effects": {"exploration": 2, "courage": 1}},
-            {"text": "Прислушаться к звукам и попытаться понять, что там.", "effects": {"observation": 2, "caution": 1}},
-            {"text": "Оставить дверь закрытой и вернуться к карте.", "effects": {"discipline": 2, "strategy": 1}}
-        ],
-        "neutral": "Дверь приоткрывается сама, и ты видишь сад, полный цветов и света. Это обещает новое начало."
-    },
-    {
-        "id": 5,
-        "title": "Письмо на столе",
-        "text": "В центре комнаты стоит стол, на котором лежит конверт. Внутри — письмо, адресованное тебе. Ты не узнаёшь почерк.",
-        "choices": [
-            {"text": "Вскрыть письмо и прочитать его сразу.", "effects": {"decisiveness": 2, "curiosity": 1}},
-            {"text": "Отложить письмо, чтобы прочитать позже.", "effects": {"patience": 2, "discipline": 1}},
-            {"text": "Показать письмо отражению в зеркале.", "effects": {"communication": 1, "trust": 2}}
-        ],
-        "neutral": "Письмо оказывается написанным тобой же — но из будущего. Ты читаешь слова, которые меняют твой взгляд на происходящее."
-    },
-    {
-        "id": 6,
-        "title": "Закат за окном",
-        "text": "Ты замечаешь, что за окном начался закат. Небо окрасилось в оранжево-розовые тона. Ты чувствуешь, что время идёт.",
-        "choices": [
-            {"text": "Наблюдать закат, наслаждаясь тишиной.", "effects": {"presence": 2, "empathy": 1}},
-            {"text": "Попытаться поймать луч света и загадать желание.", "effects": {"imagination": 2, "courage": 1}},
-            {"text": "Закрыть окно и сосредоточиться на поиске выхода.", "effects": {"discipline": 2, "strategy": 1}}
-        ],
-        "neutral": "Закат напоминает тебе, что даже самый долгий день заканчивается. Это не конец, а переход."
-    },
-    {
-        "id": 7,
-        "title": "Финал: Зеркало заново",
-        "text": "Комната начинает таять, и ты снова оказываешься перед зеркалом. Отражение теперь чёткое — это ты, но ты стал(а) другим(ой). Ты чувствуешь, что внутри тебя появилось что-то новое.",
-        "choices": [
-            {"text": "Посмотреть в глаза своему отражению и улыбнуться.", "effects": {"acceptance": 3}},
-            {"text": "Задать отражению последний вопрос: 'Кто я теперь?'", "effects": {"reflection": 3}},
-            {"text": "Отвернуться и выйти из комнаты, оставив её позади.", "effects": {"independence": 3}}
-        ],
-        "neutral": "Ты выходишь из комнаты, но знаешь: она останется с тобой. Ты изменился(ась), и это только начало."
+def get_reports(user_id, limit=5):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "SELECT * FROM reports WHERE user_id = %s ORDER BY timestamp DESC LIMIT %s",
+            (user_id, limit)
+        )
+        rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def calculate_profile(answers):
+    scores = {name: 0 for name in ARCHETYPES}
+    for q in MAP_QUESTIONS:
+        qid = q["id"]
+        selected_label = answers.get(qid)
+        if not selected_label:
+            continue
+        for opt in q["options"]:
+            if opt["label"] == selected_label:
+                for arch in opt["archetypes"]:
+                    scores[arch] += 1
+                break
+    sorted_archetypes = sorted(scores.items(), key=lambda x: (-x[1], x[0]))
+    core = sorted_archetypes[0][0]
+    support = sorted_archetypes[1][0] if len(sorted_archetypes) > 1 else core
+    compass = sorted_archetypes[2][0] if len(sorted_archetypes) > 2 else support
+    min_score = sorted_archetypes[-1][1]
+    shadow_candidates = [a for a, s in sorted_archetypes if s == min_score and a != core]
+    shadow = shadow_candidates[0] if shadow_candidates else sorted_archetypes[-1][0]
+    if shadow == core and len(sorted_archetypes) > 1:
+        shadow = sorted_archetypes[-2][0]
+    return {
+        "core": core,
+        "support": support,
+        "compass": compass,
+        "shadow": shadow,
+        "scores": dict(scores),
+        "sorted": sorted_archetypes,
     }
-]
 
-def get_novel_state(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    row = conn.execute("SELECT * FROM novel_state WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close()
-    if row is None:
-        return None
-    state = dict(row)
-    state['choices'] = json.loads(state['choices'] or '[]')
-    state['parameters'] = json.loads(state['parameters'] or '{}')
-    return state
+def get_archetype_data(name):
+    return ARCHETYPES.get(name)
 
-def save_novel_state(user_id, state):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """INSERT OR REPLACE INTO novel_state 
-           (user_id, episode, choices, parameters, completed, paid, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, datetime('now'))""",
-        (user_id, state.get('episode', 0),
-         json.dumps(state.get('choices', [])),
-         json.dumps(state.get('parameters', {})),
-         state.get('completed', 0),
-         state.get('paid', 0))
-    )
-    conn.commit()
-    conn.close()
+def get_metaphor_by_core(core):
+    return METAPHORS.get(core, "оркестр")
 
-def create_novel_state(user_id):
-    state = {'episode': 0, 'choices': [], 'parameters': {}, 'completed': 0, 'paid': 0}
-    save_novel_state(user_id, state)
-    return state
+def get_affirmation_by_core(core):
+    return AFFIRMATIONS_BY_CORE.get(core, "Ты на правильном пути.")
 
-def get_episode(episode_id):
-    for ep in NOVEL_EPISODES:
-        if ep['id'] == episode_id:
-            return ep
-    return None
+def build_profile_text(profile, user_name="Армен"):
+    core = profile["core"]
+    support = profile["support"]
+    compass = profile["compass"]
+    shadow = profile["shadow"]
+    core_data = get_archetype_data(core)
+    support_data = get_archetype_data(support)
+    compass_data = get_archetype_data(compass)
+    shadow_data = get_archetype_data(shadow)
+    text = f"""🎯 Профиль построен, {user_name}
 
-def calculate_archetype_from_params(params):
-    # Простая логика: если параметров мало, возвращаем ENFP как пример
-    return "ENFP"
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 
-# ──────────────────────────────────────────────────────────────
-# ТЕСТ (12 вопросов)
-# ──────────────────────────────────────────────────────────────
-QUICK_TEST = [
-    {"question": "Когда у тебя свободный вечер, ты скорее...", "option_a": "Побудешь дома в тишине", "option_b": "Позвонишь другу или выйдешь в люди", "a_dim": "I", "b_dim": "E"},
-    {"question": "Принимая важное решение, ты опираешься на...", "option_a": "Конкретные факты и опыт", "option_b": "Интуицию и общую картину", "a_dim": "S", "b_dim": "N"},
-    {"question": "В трудной ситуации тебе важнее...", "option_a": "Найти логичное решение", "option_b": "Сохранить гармонию", "a_dim": "T", "b_dim": "F"},
-    {"question": "Твой подход к делам и планам...", "option_a": "Планирую заранее", "option_b": "Действую по ситуации", "a_dim": "J", "b_dim": "P"},
-    {"question": "После насыщенного дня тебе помогает восстановиться...", "option_a": "Тихий отдых наедине с собой", "option_b": "Разговор с близкими", "a_dim": "I", "b_dim": "E"},
-    {"question": "Тебе интереснее...", "option_a": "Работать с конкретными вещами", "option_b": "Исследовать идеи и теории", "a_dim": "S", "b_dim": "N"},
-    {"question": "Как ты справляешься с дедлайнами?", "option_a": "Делаю заранее", "option_b": "Работаю в последний момент", "a_dim": "J", "b_dim": "P"},
-    {"question": "В компании незнакомых людей ты...", "option_a": "Быстро вливаешься в разговор", "option_b": "Держишься в стороне", "a_dim": "E", "b_dim": "I"},
-    {"question": "При описании события ты обычно...", "option_a": "Точно перечисляешь детали", "option_b": "Передаёшь общее впечатление", "a_dim": "S", "b_dim": "N"},
-    {"question": "При принятии решения ты...", "option_a": "Анализируешь все за и против", "option_b": "Прислушиваешься к интуиции", "a_dim": "T", "b_dim": "F"},
-    {"question": "Ты предпочитаешь...", "option_a": "Иметь чёткий план на день", "option_b": "Импровизировать по ходу", "a_dim": "J", "b_dim": "P"},
-    {"question": "После долгого общения ты чувствуешь...", "option_a": "Прилив энергии и желание продолжать", "option_b": "Усталость и потребность в тишине", "a_dim": "E", "b_dim": "I"}
-]
+🔥 ЯДРО — {core} ({core_data["ennea"]})
+Ты движим: {core_data["desire"]}
+Твоя сила: {core_data["strength"]}
+Твоя тень: {core_data["shadow"]}
 
-ARCHETYPE_NAMES = {
-    "INTJ": "Дирижёр", "ENTJ": "Командир", "INTP": "Мыслитель", "ENTP": "Новатор",
-    "INFJ": "Наставник", "ENFJ": "Вдохновитель", "ISTJ": "Хранитель", "ESTJ": "Администратор",
-    "ISFJ": "Заботливый", "ESFJ": "Душа компании", "ISTP": "Мастер", "ESTP": "Искатель",
-    "ISFP": "Художник", "ESFP": "Жизнелюб", "INFP": "Идеалист", "ENFP": "Исследователь"
-}
+⚡ Правило: {core_data["rule"]}
 
-# Полные интерпретации (16 штук) – сокращённые для быстрого показа, но полные доступны по /archetype
-ARCHETYPE_SHORT_DESC = {
-    "INTJ": "Ты — Дирижёр. Ты строишь системы из хаоса. Твоя зона роста — научиться отдыхать и не брать всё на себя.",
-    "ENTJ": "Ты — Командир. Ты ведёшь за собой и достигаешь целей. Твоя зона роста — быть добрее к себе и другим.",
-    "INTP": "Ты — Мыслитель. Ты находишь нестандартные решения. Твоя зона роста — переходить от анализа к действию.",
-    "ENTP": "Ты — Новатор. Ты генерируешь идеи. Твоя зона роста — доводить начатое до конца.",
-    "INFJ": "Ты — Наставник. Ты понимаешь и вдохновляешь людей. Твоя зона роста — заботиться о себе так же, как о других.",
-    "ENFJ": "Ты — Вдохновитель. Ты заряжаешь других энергией. Твоя зона роста — не выгорать, замечая свои потребности.",
-    "ISTJ": "Ты — Хранитель. Ты надёжная опора. Твоя зона роста — учиться гибкости и переменам.",
-    "ESTJ": "Ты — Администратор. Ты наводишь порядок. Твоя зона роста — смягчать требовательность к себе и другим.",
-    "ISFJ": "Ты — Заботливый. Ты внимателен к деталям и людям. Твоя зона роста — помнить о своих желаниях.",
-    "ESFJ": "Ты — Душа компании. Ты объединяешь людей. Твоя зона роста — находить опору в себе, а не в чужих оценках.",
-    "ISTP": "Ты — Мастер. Ты разбираешься в механизмах. Твоя зона роста — не избегать обязательств.",
-    "ESTP": "Ты — Искатель. Ты быстро действуешь. Твоя зона роста — думать о последствиях.",
-    "ISFP": "Ты — Художник. Ты создаёшь красоту. Твоя зона роста — не прятаться от критики.",
-    "ESFP": "Ты — Жизнелюб. Ты наполняешь жизнь красками. Твоя зона роста — не избегать глубоких тем.",
-    "INFP": "Ты — Идеалист. Ты видишь хорошее в людях. Твоя зона роста — воплощать мечты в реальность.",
-    "ENFP": "Ты — Исследователь. Ты открываешь новые возможности. Твоя зона роста — доводить дела до конца."
-}
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 
-ARCHETYPE_FULL_DESC = {
-    "INTJ": (
-        "Ты — Дирижёр. Там, где другие видят хаос, ты видишь будущую систему. "
-        "Тебе легко держать в голове большую картину: куда всё движется, что важно, а что — шум. "
-        "Люди рядом часто удивляются, как у тебя «всё продумано».\n\n"
-        "Решения ты принимаешь головой: взвешиваешь, просчитываешь, смотришь на несколько шагов вперёд. "
-        "Это делает тебя надёжным стратегом, но иногда мешает услышать собственные чувства — они кажутся «нелогичными» и откладываются на потом.\n\n"
-        "Наполняет тебя порядок и прогресс: когда план работает, когда сложное становится понятным, когда есть время подумать в тишине. "
-        "Истощает — суета, бесконечные согласования и люди, которые «просто поговорить».\n\n"
-        "💫 На что обратить внимание: ты часто берёшь на себя больше, чем нужно, и тянешь до последнего. "
-        "Усталость подкрадывается незаметно — ты замечаешь её, когда уже на нуле.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт — твой главный инструмент. "
-        "Он поможет замечать не только сделанное, но и то, как ты себя при этом чувствуешь. "
-        "А чек-ин дня подскажет связь: в какие дни ты успеваешь позаботиться о себе — и как это меняет твоё состояние."
-    ),
-    "ENTJ": (
-        "Ты — Командир. Ты умеешь брать ответственность, когда другие сомневаются, и вести за собой. "
-        "Цель для тебя — не мечта, а маршрут: ты видишь шаги и начинаешь идти.\n\n"
-        "Решения ты принимаешь быстро и уверенно, опираясь на логику и результат. "
-        "Это твоя сила — но из-за скорости ты иногда не успеваешь спросить себя: «А чего я сам(а) сейчас хочу?»\n\n"
-        "Наполняют тебя движение и победы: закрытые задачи, растущие результаты, люди, которые загорелись твоей идеей. "
-        "Истощает — топтание на месте, нерешительность вокруг и необходимость долго ждать.\n\n"
-        "💫 На что обратить внимание: требовательность, которая помогает тебе достигать, может становиться жёсткостью — к другим и особенно к себе. "
-        "Внутренний критик у тебя работает сверхурочно.\n\n"
-        "Как использовать «Якорь»: в вечернем отчёте попробуй хвалить себя за процесс, а не только за результат. "
-        "Чек-ин дня покажет: в дни, когда ты позволяешь себе паузу, энергии на цели остаётся больше, а не меньше."
-    ),
-    "INTP": (
-        "Ты — Мыслитель. Твой ум — это лаборатория: ты крутишь идею со всех сторон, находишь неожиданные связи и решения, до которых никто не додумался. "
-        "Тебе интересно не «как принято», а «как на самом деле устроено».\n\n"
-        "Решения ты принимаешь через понимание: пока картинка не сложилась, действовать не хочется. "
-        "Это даёт глубину, но иногда превращается в бесконечный анализ — идеальный момент для старта всё не наступает.\n\n"
-        "Наполняет тебя интеллектуальная свобода: интересная задача, новая книга, разговор по существу. "
-        "Истощают — рутина, формальности и необходимость объяснять очевидное.\n\n"
-        "💫 На что обратить внимание: ты можешь надолго застревать в размышлениях вместо действия. "
-        "Мысль «я ещё не готов(а)» часто просто маскирует усталость или страх.\n\n"
-        "Как использовать «Якорь»: чек-ин дня — твой мостик от «думаю» к «делаю»: три маленьких практики, которые не требуют идеальных условий. "
-        "А вечерний отчёт поможет увидеть, что сделанного за день больше, чем кажется твоему строгому внутреннему аналитику."
-    ),
-    "ENTP": (
-        "Ты — Новатор. Идеи приходят к тебе быстрее, чем ты успеваешь их записывать. "
-        "Ты видишь возможности там, где другие видят стену, и умеешь заражать энтузиазмом.\n\n"
-        "Решения ты принимаешь в движении: попробовать, посмотреть, скорректировать. "
-        "Тебе проще начать десять дел, чем идеально спланировать одно — и в этом твоя живость.\n\n"
-        "Наполняют тебя новизна и азарт: свежий проект, спор, в котором рождается истина, неожиданный поворот. "
-        "Истощают — монотонность, бюрократия и «так положено».\n\n"
-        "💫 На что обратить внимание: новые идеи манят тебя сильнее, чем завершение старых. "
-        "Из-за этого копятся «почти законченные» дела, и они тихо забирают энергию.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт помогает поставить точку в дне — маленькое завершение каждый вечер. "
-        "А раздел «История» станет твоей коллекцией доведённого до конца: листать её приятнее, чем список брошенного."
-    ),
-    "INFJ": (
-        "Ты — Наставник. Ты чувствуешь людей глубже, чем они сами себя понимают, и умеешь находить слова, после которых становится легче. "
-        "У тебя редкий дар: видеть в человеке лучшее и помогать этому лучшему прорасти.\n\n"
-        "Решения ты принимаешь сердцем, сверяясь с внутренним компасом смысла: «зачем это?» для тебя важнее, чем «сколько это принесёт?». "
-        "Поэтому тебе тяжело в делах, в которых ты не видишь смысла.\n\n"
-        "Наполняют тебя глубокие разговоры, тишина и ощущение, что ты кому-то помог(ла). "
-        "Истощают — поверхностное общение, конфликты и чужая боль, которую ты впитываешь как губка.\n\n"
-        "💫 На что обратить внимание: заботясь о других, ты систематически забываешь про себя. "
-        "Твои потребности встают в очередь последними — и очередь до них часто не доходит.\n\n"
-        "Как использовать «Якорь»: чек-ин дня — это три минуты только про тебя. "
-        "А вечерний отчёт поможет замечать дни, когда ты отдавал(а) больше, чем восполнял(а) — чтобы успеть восстановиться до, а не после выгорания."
-    ),
-    "ENFJ": (
-        "Ты — Вдохновитель. Рядом с тобой люди верят в себя чуть больше. "
-        "Ты умеешь видеть потенциал, поддерживать в нужный момент и собирать людей вокруг доброго дела.\n\n"
-        "Решения ты принимаешь с оглядкой на людей: как это отразится на близких, на команде, на атмосфере. "
-        "Это делает тебя душой любого коллектива — но свои интересы ты в этом уравнении часто не учитываешь.\n\n"
-        "Наполняет тебя отклик: благодарность, тёплые отношения, чужие успехи, к которым ты причастен(на). "
-        "Истощают — равнодушие, конфликты и ощущение, что ты стараешься в одностороннем порядке.\n\n"
-        "💫 На что обратить внимание: ты заряжаешь всех вокруг и незаметно выгораешь сам(а). "
-        "Пока батарейка не села до конца, ты убеждаешь себя, что «всё нормально».\n\n"
-        "Как использовать «Якорь»: оценка состояния в чек-ине — твой индикатор батарейки, смотри на неё честно. "
-        "В вечернем отчёте записывай не только что ты сделал(а) для других, но и что сегодня сделал(а) для себя — пусть это станет привычкой."
-    ),
-    "ISTJ": (
-        "Ты — Хранитель. На тебя можно положиться: если ты пообещал(а) — будет сделано. "
-        "Ты создаёшь вокруг себя островки стабильности, и людям рядом с тобой спокойно.\n\n"
-        "Решения ты принимаешь основательно: опираешься на факты, опыт и здравый смысл. "
-        "Тебе важно понимать правила игры — и ты честно по ним играешь.\n\n"
-        "Наполняют тебя порядок и предсказуемость: выполненный план, налаженный быт, традиции, которые объединяют. "
-        "Истощают — внезапные перемены, расплывчатые задачи и люди, которые не держат слово.\n\n"
-        "💫 На что обратить внимание: ты держишься за проверенное и тяжело перестраиваешься, даже когда старый способ уже не работает. "
-        "Гибкость — не предательство порядка, а его продолжение.\n\n"
-        "Как использовать «Якорь»: тебе идеально подойдёт сама структура бота — утро, день, вечер, всё по расписанию. "
-        "Используй чек-ин, чтобы бережно пробовать новое маленькими шагами: одна небольшая практика в день — это перемены без стресса."
-    ),
-    "ESTJ": (
-        "Ты — Администратор. Ты умеешь превращать беспорядок в работающую систему: распределить, организовать, довести до результата. "
-        "Там, где ты — там дела двигаются.\n\n"
-        "Решения ты принимаешь быстро и по существу: факты, сроки, ответственные. "
-        "Ты не любишь ходить вокруг да около — и люди ценят твою прямоту, даже если она бывает колючей.\n\n"
-        "Наполняют тебя видимые результаты: выполненный план, наведённый порядок, признание твоего вклада. "
-        "Истощают — необязательность, хаос и разговоры без решений.\n\n"
-        "💫 На что обратить внимание: твоя требовательность иногда перевешивает тепло. "
-        "К себе ты, кстати, строже всего — и редко разрешаешь себе просто отдохнуть без «заслужил(а)».\n\n"
-        "Как использовать «Якорь»: в вечернем отчёте отмечай не только результаты, но и моменты человеческого тепла за день — они тоже достижение. "
-        "Чек-ин поможет встроить отдых в план: если отдых в списке задач, ты его выполнишь."
-    ),
-    "ISFJ": (
-        "Ты — Заботливый. Ты замечаешь то, что другие пропускают: кто устал, у кого что случилось, что нужно сделать, чтобы всем было хорошо. "
-        "Твоя забота тихая, без фанфар — но именно на таких, как ты, всё держится.\n\n"
-        "Решения ты принимаешь сердцем, но проверяешь опытом: тебе важно, чтобы было и по-доброму, и надёжно. "
-        "Ты редко рискуешь тем, что дорого.\n\n"
-        "Наполняют тебя благодарность близких, уют и ощущение, что ты нужен(на). "
-        "Истощают — конфликты, критика и ощущение, что твою заботу принимают как должное.\n\n"
-        "💫 На что обратить внимание: ты так заботишься о близких, что твои собственные желания вечно остаются «на потом». "
-        "Но забота о себе — не эгоизм, а условие, чтобы тебя хватило надолго.\n\n"
-        "Как использовать «Якорь»: пусть чек-ин дня станет твоим личным ритуалом заботы — о себе. "
-        "В вечернем отчёте каждый день называй одну вещь, которую ты сделал(а) сегодня для себя. Сначала будет непривычно — потом станет опорой."
-    ),
-    "ESFJ": (
-        "Ты — Душа компании. Ты умеешь объединять людей: помнишь дни рождения, чувствуешь атмосферу, создаёшь тепло, к которому тянутся. "
-        "С тобой праздник — праздничнее, а трудности — легче.\n\n"
-        "Решения ты принимаешь с учётом всех: тебе искренне важно, чтобы никто не остался обиженным. "
-        "Гармония вокруг — твой главный проект.\n\n"
-        "Наполняют тебя общение, признание и совместность: семейный ужин, встреча с друзьями, доброе слово. "
-        "Истощают — ссоры, холодность и одиночество, которое ты переносишь тяжелее многих.\n\n"
-        "💫 На что обратить внимание: тебе бывает слишком важно, что о тебе подумают. "
-        "Чужие оценки — шаткая опора: сегодня хвалят, завтра нет, а тебе жить в этих качелях.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт — место, где важно только твоё мнение о твоём дне. "
-        "Оценка состояния в чек-ине научит сверяться с собой: «как я?» — вопрос, на который никто другой не ответит."
-    ),
-    "ISTP": (
-        "Ты — Мастер. Ты понимаешь, как устроены вещи — от механизмов до ситуаций. "
-        "Пока другие обсуждают проблему, ты уже молча её чинишь.\n\n"
-        "Решения ты принимаешь по ситуации: спокойно, практично, без драм. "
-        "Ты не паникуешь в кризис — наоборот, именно тогда ты в своей стихии.\n\n"
-        "Наполняют тебя работа руками и головой, свобода действовать по-своему и осязаемый результат. "
-        "Истощают — длинные разговоры, эмоциональное давление и обещания на годы вперёд.\n\n"
-        "💫 На что обратить внимание: ты избегаешь обязательств и долгих планов — и вместе с ними иногда избегаешь близости и важных решений. "
-        "Не всё, что связывает, ограничивает.\n\n"
-        "Как использовать «Якорь»: тебе не нужны громкие ритуалы — чек-ин занимает минуту, и это просто три галочки. "
-        "Вечерний отчёт можешь вести телеграфно, по делу: даже пара честных фраз в день со временем сложится в ясную картину."
-    ),
-    "ESTP": (
-        "Ты — Искатель. Ты живёшь здесь и сейчас: быстро оцениваешь ситуацию, быстро действуешь, быстро встаёшь после падений. "
-        "Там, где нужны решительность и драйв, тебе нет равных.\n\n"
-        "Решения ты принимаешь мгновенно, доверяя чутью и реакции. "
-        "Чаще всего это работает — ты действительно хорошо читаешь момент.\n\n"
-        "Наполняют тебя адреналин и живой опыт: движение, люди, вызовы, новые места. "
-        "Истощают — ожидание, теория без практики и сидение на месте.\n\n"
-        "💫 На что обратить внимание: ты действуешь быстрее, чем успеваешь подумать о последствиях. "
-        "Большинство проблем в твоей жизни — не от ошибок, а от скорости.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт — твоя ежедневная пауза, пять минут торможения перед сном. "
-        "Оглянуться на день, заметить, что сработало, а что можно было сделать спокойнее — это не скучно, это прокачка твоего чутья."
-    ),
-    "ISFP": (
-        "Ты — Художник. Ты чувствуешь красоту там, где другие проходят мимо: в свете, звуке, жесте, моменте. "
-        "Ты живёшь тихо, но глубоко — и то, что ты создаёшь, несёт твоё тепло.\n\n"
-        "Решения ты принимаешь сердцем и в своём темпе: тебе нужно, чтобы выбор «отозвался». "
-        "Давление и дедлайны сбивают твой внутренний компас.\n\n"
-        "Наполняют тебя творчество, природа, близкие люди и возможность быть собой без объяснений. "
-        "Истощают — грубость, жёсткие рамки и необходимость выставлять себя напоказ.\n\n"
-        "💫 На что обратить внимание: ты близко к сердцу принимаешь критику и из-за этого порой прячешь своё — идеи, чувства, творчество. "
-        "Мир недополучает тебя, а ты — мира.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт — твоё безопасное пространство: здесь никто не оценивает и не критикует. "
-        "Записывай ощущения дня как художник — образами, честно. Со временем «История» станет дневником, который покажет: твои чувства — не слабость, а точный инструмент."
-    ),
-    "ESFP": (
-        "Ты — Жизнелюб. Ты умеешь превращать обычный день в хороший: находить поводы для радости, заражать смехом, замечать вкус жизни. "
-        "С тобой теплее — это факт.\n\n"
-        "Решения ты принимаешь легко и по любви: выбираешь то, что радует. "
-        "Спонтанность — твой стиль, и она часто приводит тебя в удивительные места.\n\n"
-        "Наполняют тебя люди, впечатления и настоящий момент: музыка, вкусная еда, объятия, движение. "
-        "Истощают — скука, негатив и разговоры, от которых тяжело на душе.\n\n"
-        "💫 На что обратить внимание: ты избегаешь тяжёлых тем — переключаешься, отшучиваешься, откладываешь. "
-        "Но непрожитое не исчезает, оно копится и ждёт.\n\n"
-        "Как использовать «Якорь»: три вопроса вечернего отчёта — это способ разбирать сложное маленькими порциями, без погружения в тяжесть. "
-        "Пять минут честности в день — и не придётся разгребать завалы годами. А чек-ин добавит в твою спонтанность каплю полезной регулярности."
-    ),
-    "INFP": (
-        "Ты — Идеалист. Ты видишь в людях хорошее — даже когда они сами в себе его не видят. "
-        "Внутри тебя целый мир: ценности, мечты, истории. Ты не размениваешься на мелкое — тебе нужен смысл.\n\n"
-        "Решения ты принимаешь по внутреннему камертону: «моё — не моё». "
-        "Ты можешь долго терпеть неудобства, но не можешь долго жить против своих ценностей.\n\n"
-        "Наполняют тебя творчество, глубокие связи и ощущение, что ты живёшь свою, а не чужую жизнь. "
-        "Истощают — цинизм, конфликты и рутина без смысла.\n\n"
-        "💫 На что обратить внимание: ты живёшь в мечтах больше, чем в действиях. "
-        "Мечта без шагов со временем начинает не вдохновлять, а укорять.\n\n"
-        "Как использовать «Якорь»: чек-ин дня — это три маленьких шага, которые не требуют героизма, но каждый день чуть-чуть приближают к твоему. "
-        "А вечерний отчёт покажет: путь складывается не из подвигов, а из прожитых со смыслом дней — и у тебя их становится всё больше."
-    ),
-    "ENFP": (
-        "Ты — Исследователь. Мир для тебя — карта возможностей: ты видишь двери там, где другие видят стены, и вдохновляешься быстрее всех. "
-        "Твой энтузиазм заразителен — рядом с тобой людям хочется жить смелее.\n\n"
-        "Решения ты принимаешь сердцем и интуицией: если внутри загорелось — значит, туда. "
-        "Этот огонь — твой двигатель, но он же уносит тебя к новому раньше, чем закончено старое.\n\n"
-        "Наполняют тебя новизна, люди и свобода: новые идеи, вдохновляющие разговоры, возможность менять маршрут. "
-        "Истощают — рутина, микроконтроль и ощущение клетки.\n\n"
-        "💫 На что обратить внимание: тебе трудно доводить начатое до конца. "
-        "Незавершённые дела копятся фоном и тихо съедают ту самую энергию, которая нужна тебе для нового.\n\n"
-        "Как использовать «Якорь»: вечерний отчёт — твоя точка завершения дня: каждый вечер ты ставишь маленькую точку, и это тренирует мышцу «доводить». "
-        "Загляни в «Историю» через пару недель — увидишь, сколько всего ты уже довёл(а) до конца. Для тебя это лучшая мотивация."
-    )
-}
+🛡️ ОПОРА — {support} ({support_data["ennea"]})
+Ты движим: {support_data["desire"]}
+Твоя сила: {support_data["strength"]}
 
-# ──────────────────────────────────────────────────────────────
-# ПРАКТИКИ ДЛЯ КАЖДОГО АРХЕТИПА (из SCHEDULE)
-# ──────────────────────────────────────────────────────────────
-SCHEDULE = {
-    "INTJ": {
-        "morning": ("Утро Дирижёра", "Запиши 3 приоритета дня — без лишнего.", "Я строю то, что имеет значение."),
-        "day": ("День Дирижёра", "Убери одно ненужное дело из списка.", "Мой фокус — моя суперсила."),
-        "evening": ("Вечер Дирижёра", "Оцени, что пошло по плану, а что — нет.", "Я контролирую важное и отпускаю лишнее.")
-    },
-    "ENTJ": {
-        "morning": ("Утро Командира", "Определи главный результат дня.", "Я веду — значит, я отвечаю."),
-        "day": ("День Командира", "Делегируй одну задачу.", "Сила в доверии команде."),
-        "evening": ("Вечер Командира", "Похвали себя за одно решение.", "Каждый день я становлюсь лучшей версией лидера.")
-    },
-    "INTP": {
-        "morning": ("Утро Мыслителя", "Запиши одну идею, которая крутится в голове.", "Мои мысли — мой компас."),
-        "day": ("День Мыслителя", "Останови анализ на одну задачу и просто сделай её.", "Действие — лучшая гипотеза."),
-        "evening": ("Вечер Мыслителя", "Что сегодня оказалось интереснее, чем ты ожидал?", "Я нахожу смысл в каждом опыте.")
-    },
-    "ENTP": {
-        "morning": ("Утро Новатора", "Выбери одну идею и сделай первый шаг.", "Я превращаю идеи в реальность."),
-        "day": ("День Новатора", "Доведи до конца хотя бы одно начатое дело.", "Завершение — тоже творчество."),
-        "evening": ("Вечер Новатора", "Что сегодня тебя по-настоящему зажгло?", "Мой огонь не гаснет.")
-    },
-    "INFJ": {
-        "morning": ("Утро Наставника", "Подумай: кому сегодня ты можешь помочь?", "Моя чуткость — дар, а не слабость."),
-        "day": ("День Наставника", "Сделай что-то для себя — не для других.", "Я забочусь о себе так же, как о близких."),
-        "evening": ("Вечер Наставника", "Назови одну границу, которую ты сегодня удержал.", "Я в безопасности, когда остаюсь собой.")
-    },
-    "ENFJ": {
-        "morning": ("Утро Вдохновителя", "Напиши кому-то тёплое сообщение с утра.", "Моя энергия меняет мир вокруг."),
-        "day": ("День Вдохновителя", "Найди минуту тишины только для себя.", "Я заряжаю других, когда сам заряжен."),
-        "evening": ("Вечер Вдохновителя", "Что сегодня дало тебе силу, а не забрало её?", "Я умею восстанавливаться.")
-    },
-    "ISTJ": {
-        "morning": ("Утро Хранителя", "Проверь план и расставь задачи по порядку.", "Надёжность начинается с меня."),
-        "day": ("День Хранителя", "Позволь себе отступить от одного правила.", "Гибкость — это тоже сила."),
-        "evening": ("Вечер Хранителя", "Что сегодня прошло стабильно и надёжно?", "Мой вклад важен.")
-    },
-    "ESTJ": {
-        "morning": ("Утро Администратора", "Составь чёткий список на день.", "Порядок — основа моего успеха."),
-        "day": ("День Администратора", "Спроси мнение кого-то, прежде чем принять решение.", "Разные взгляды делают решение сильнее."),
-        "evening": ("Вечер Администратора", "Что сегодня удалось организовать лучше всего?", "Я строю — и это ценно.")
-    },
-    "ISFJ": {
-        "morning": ("Утро Заботливого", "Запланируй одну маленькую приятность для себя.", "Моя забота начинается с меня."),
-        "day": ("День Заботливого", "Скажи «нет» хотя бы одной просьбе.", "Мои границы — это уважение к себе."),
-        "evening": ("Вечер Заботливого", "Кого ты сегодня поддержал? Как ты себя чувствуешь?", "Я достаточно сделал сегодня.")
-    },
-    "ESFJ": {
-        "morning": ("Утро Души компании", "Напланируй одну встречу или созвон с близким.", "Мои связи — моя сила."),
-        "day": ("День Души компании", "Сделай что-то без чужого одобрения.", "Я ценен сам по себе."),
-        "evening": ("Вечер Души компании", "Кто сегодня подарил тебе тепло?", "Я окружён заботой.")
-    },
-    "ISTP": {
-        "morning": ("Утро Мастера", "Выбери одну задачу и разберись с ней полностью.", "Я решаю проблемы — это моё призвание."),
-        "day": ("День Мастера", "Попробуй объяснить кому-то, как ты решил задачу.", "Мои знания ценны для других."),
-        "evening": ("Вечер Мастера", "Что сегодня сработало лучше, чем ожидалось?", "Я доверяю своим рукам и голове.")
-    },
-    "ESTP": {
-        "morning": ("Утро Искателя", "Брось вызов себе: сделай что-то необычное утром.", "Я живу в движении."),
-        "day": ("День Искателя", "Остановись на 5 минут и подумай о последствиях.", "Осознанность делает меня сильнее."),
-        "evening": ("Вечер Искателя", "Что сегодня было по-настоящему живым?", "Каждый день — приключение.")
-    },
-    "ISFP": {
-        "morning": ("Утро Художника", "Найди красоту в одной мелочи вокруг.", "Красота — в простом."),
-        "day": ("День Художника", "Создай что-то руками или словами — пусть маленькое.", "Творчество — мой язык."),
-        "evening": ("Вечер Художника", "Что сегодня тронуло тебя больше всего?", "Я чувствую — и это моя сила.")
-    },
-    "ESFP": {
-        "morning": ("Утро Жизнелюба", "Запланируй что-то радостное на сегодня.", "Жизнь — это праздник, который я создаю."),
-        "day": ("День Жизнелюба", "Посиди 10 минут в тишине, без телефона.", "В тишине я слышу себя."),
-        "evening": ("Вечер Жизнелюба", "Что сегодня заставило тебя улыбнуться?", "Я несу свет туда, куда прихожу.")
-    },
-    "INFP": {
-        "morning": ("Утро Идеалиста", "Запиши одну ценность, которая важна тебе сегодня.", "Мои идеалы — моя сила."),
-        "day": ("День Идеалиста", "Сделай один конкретный шаг к мечте.", "Мечта живёт в действии."),
-        "evening": ("Вечер Идеалиста", "Что сегодня совпало с твоими ценностями?", "Я верен себе.")
-    },
-    "ENFP": {
-        "morning": ("Утро Исследователя", "Что нового ты хочешь попробовать сегодня?", "Мир полон возможностей для меня."),
-        "day": ("День Исследователя", "Доведи одно дело до конца — полностью.", "Я умею завершать то, что начинаю."),
-        "evening": ("Вечер Исследователя", "Что тебя сегодня вдохновило по-новому?", "Каждый день открывает что-то новое.")
-    }
-}
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 
-def get_schedule(archetype):
-    return SCHEDULE.get(archetype, SCHEDULE.get("INTJ"))
+🧭 КОМПАС — {compass} ({compass_data["ennea"]})
+Ты движим: {compass_data["desire"]}
+Твоя сила: {compass_data["strength"]}
 
-def get_practice_text(archetype, period):
-    sched = get_schedule(archetype)
-    return sched.get(period, ("", "", ""))
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 
-# ──────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ──────────────────────────────────────────────────────────────
-def escape_markdown(text):
-    if not isinstance(text, str):
-        return text
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in escape_chars else c for c in text)
+🌑 ТЕНЬ — {shadow} ({shadow_data["ennea"]})
+Ты скрываешь: {shadow_data["shadow"]}
 
-def calculate_archetype(answers):
-    dims = {'E': 0, 'I': 0, 'S': 0, 'N': 0, 'T': 0, 'F': 0, 'J': 0, 'P': 0}
-    for i, ans in enumerate(answers):
-        q = QUICK_TEST[i]
-        if ans == 0:
-            dims[q['a_dim']] += 1
-        else:
-            dims[q['b_dim']] += 1
-    e = 'E' if dims['E'] >= dims['I'] else 'I'
-    s = 'S' if dims['S'] >= dims['N'] else 'N'
-    t = 'T' if dims['T'] >= dims['F'] else 'F'
-    j = 'J' if dims['J'] >= dims['P'] else 'P'
-    return e + s + t + j
+⚡ Правило: {shadow_data["rule"]}
 
-def extract_key_phrase(text):
-    words = text.split()
-    if len(words) <= 7:
-        return text[:60] + "..." if len(text) > 60 else text
-    return ' '.join(words[:7]) + "..."
+━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 
-def build_room(user):
-    phrases = user.get('key_phrases', [])
-    name = user.get('character_name', 'Мини-Я')
-    archetype_code = get_user_archetype(user) or ''
-    archetype_name = ARCHETYPE_NAMES.get(archetype_code, 'Человек')
-    if not phrases:
-        return f"🏠 *Комната {escape_markdown(name)}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
-    text = f"🏠 *Комната {escape_markdown(name)}*\n\n"
-    text += f"Ты — {archetype_name}. Ты прошёл(ла) {len(phrases)} из 7 дней.\n\n"
-    text += "Твои слова, которые остались со мной:\n\n"
-    for i, phrase in enumerate(phrases, 1):
-        text += f"{i}. {escape_markdown(phrase)}\n"
-    if len(phrases) >= 7:
-        text += "\n✨ Ты завершил(а) путешествие! Комната наполнилась твоими голосами."
+Теперь я буду говорить с тобой на языке {core}.
+Если захочешь перепройти — нажми «🎯 Стиль».
+"""
     return text
 
-# ──────────────────────────────────────────────────────────────
-# ОТПРАВКА СООБЩЕНИЙ
-# ──────────────────────────────────────────────────────────────
+def get_practice_by_id(pid):
+    for p in PRACTICES:
+        if p["id"] == pid:
+            return p
+    return None
+
+def get_user_progress(user_id):
+    user = get_user(user_id)
+    return user.get('practice_progress', {}) if user else {}
+
+def is_practice_done_today(progress, pid):
+    if pid not in progress:
+        return False
+    last_used = progress[pid].get("last_used")
+    if not last_used:
+        return False
+    today = datetime.now().date().isoformat()
+    last_date = last_used.split("T")[0] if "T" in last_used else last_used
+    return last_date == today
+
+def mark_practice_done(user_id, pid):
+    user = get_user(user_id)
+    progress = user.get('practice_progress', {})
+    now = datetime.now().isoformat()
+    today = datetime.now().date().isoformat()
+    if pid not in progress:
+        progress[pid] = {"completed_count": 0, "last_used": None, "streak": 0}
+    prog = progress[pid]
+    last_used = prog.get("last_used")
+    already_done = False
+    if last_used:
+        last_date = last_used.split("T")[0] if "T" in last_used else last_used
+        already_done = (last_date == today)
+    if not already_done:
+        prog["completed_count"] = prog.get("completed_count", 0) + 1
+        prog["last_used"] = now
+        if last_used:
+            last_date_obj = datetime.fromisoformat(last_used).date()
+            yesterday = (datetime.now() - timedelta(days=1)).date()
+            if last_date_obj == yesterday:
+                prog["streak"] = prog.get("streak", 0) + 1
+            elif last_date_obj < yesterday:
+                prog["streak"] = 1
+        else:
+            prog["streak"] = 1
+    save_user_field(user_id, 'practice_progress', progress)
+
+def undo_practice_done(user_id, pid):
+    user = get_user(user_id)
+    progress = user.get('practice_progress', {})
+    if pid in progress:
+        prog = progress[pid]
+        prog["completed_count"] = max(0, prog.get("completed_count", 0) - 1)
+        prog["last_used"] = None
+        prog["streak"] = max(0, prog.get("streak", 0) - 1)
+        save_user_field(user_id, 'practice_progress', progress)
+
+def get_block_by_id(block_id):
+    for b in BLOCKS:
+        if b["id"] == block_id:
+            return b
+    return {}
+
+def build_reply(block_ids, user_id, user_name="Армен"):
+    profile = get_user_style(user_id)
+    core = profile.get("core", "Хозяин")
+    shadow = profile.get("shadow", "Простодушный")
+    metaphor = get_metaphor_by_core(core)
+    support = profile.get("support", "Маг")
+    parts = []
+    for bid in block_ids:
+        block = get_block_by_id(bid)
+        text = block.get("text", "")
+        text = text.replace("{name}", user_name)
+        text = text.replace("{metaphor}", metaphor)
+        text = text.replace("{core}", core)
+        text = text.replace("{support}", support)
+        text = text.replace("{shadow}", shadow)
+        parts.append(text)
+    return "\n\n".join(parts)
+
+def get_blocks_for_profile(profile):
+    core = profile.get("core", "Хозяин")
+    shadow = profile.get("shadow", "Простодушный")
+    block_map = {
+        "Искатель": ["N-4", "N-5", "N-8"],
+        "Маг": ["N-4", "N-5", "N-9"],
+        "Простодушный": ["N-3", "N-6", "N-7"],
+        "Любовник": ["N-3", "N-6", "N-8"],
+        "Дирижёр": ["N-4", "N-5", "N-10"],
+        "Правитель": ["N-4", "N-5", "N-9"],
+        "Мудрец": ["N-4", "N-5", "N-9"],
+        "Воин": ["N-4", "N-5", "N-10"],
+        "Заботливый": ["N-3", "N-6", "N-7"],
+        "Герой": ["N-4", "N-5", "N-10"],
+        "Бунтарь": ["N-4", "N-5", "N-8"],
+        "Странник": ["N-4", "N-5", "N-8"],
+        "Шут": ["N-3", "N-6", "N-7"],
+        "Учитель": ["N-4", "N-5", "N-9"],
+        "Дипломат": ["N-3", "N-6", "N-7"],
+    }
+    core_blocks = block_map.get(core, ["N-4", "N-5"])
+    shadow_blocks = block_map.get(shadow, ["N-1", "N-3"])
+    return {
+        "morning": core_blocks[:2],
+        "evening": [core_blocks[0], shadow_blocks[0]],
+        "general": core_blocks[:1],
+    }
+
+def get_user_style(user_id):
+    user = get_user(user_id)
+    if user:
+        profile = user.get('archetype_profile', {})
+        if profile:
+            return profile
+    return {"core": "Хозяин", "support": "Маг", "compass": "Воин", "shadow": "Простодушный"}
+
+def get_today_schedule():
+    weekday = datetime.now().weekday()
+    schedule = {
+        "morning": [p for p in PRACTICES if p["category"] == "morning" and (weekday in p.get("schedule_days", []))],
+        "evening": [p for p in PRACTICES if p["category"] == "evening" and (weekday in p.get("schedule_days", []))],
+    }
+    return schedule
+
+def get_daily_task():
+    tasks = [
+        "Завтра перед началом дня спроси себя: что я хочу увидеть вечером?",
+        "Сегодня найди одно дело, которое можно сделать на 70%, и остановись.",
+        "Перед сном запиши: где сегодня я был хозяином дня, а где — пожарным?",
+        "Сегодня попроси помощь в одном деле. Одна рука. Не весь груз.",
+        "Найди дело, которое тянешь. Поставь точку остановки. Закрой в ней.",
+        "Сделай что-то без плана. Не пиши список. Позволь случиться хаосу.",
+        "Выбери дело, которое доводишь до идеала. Сделай на 90%. Остановись.",
+    ]
+    weekday = datetime.now().weekday()
+    return tasks[weekday % len(tasks)]
+
+# ---------- ОТПРАВКА СООБЩЕНИЙ ----------
 def send_action(chat_id, action='typing'):
     url = f"https://api.telegram.org/bot{TOKEN}/sendChatAction"
     payload = {'chat_id': chat_id, 'action': action}
@@ -649,12 +668,10 @@ def send_message(chat_id, text, parse_mode='Markdown', retries=3):
     for attempt in range(retries):
         try:
             r = requests.post(url, json=payload, timeout=10)
-            logging.info(f"Сообщение отправлено (попытка {attempt+1}), статус {r.status_code}")
             return r.json()
         except Exception as e:
-            logging.error(f"Ошибка отправки (попытка {attempt+1}): {e}")
+            logger.error(f"Ошибка отправки (попытка {attempt+1}): {e}")
             time.sleep(1)
-    logging.error(f"Не удалось отправить сообщение после {retries} попыток")
     return None
 
 def send_keyboard(chat_id, text, keyboard, parse_mode='Markdown'):
@@ -670,338 +687,498 @@ def send_keyboard(chat_id, text, keyboard, parse_mode='Markdown'):
         r = requests.post(url, json=payload, timeout=10)
         return r.json()
     except Exception as e:
-        logging.error(f"Ошибка отправки клавиатуры: {e}")
+        logger.error(f"Ошибка отправки клавиатуры: {e}")
         return None
 
-def show_main_menu(chat_id, text, waiting=False):
-    main_menu = [
-        ["🏠 Главная", "🧠 Мой Архетип"],
-        ["📋 Расписание", "🚪 Комната"],
-        ["📊 Прогресс", "🧘 Практики"],
-        ["⚙️ Настройки"]
+def answer_callback(callback_id, text=''):
+    url = f"https://api.telegram.org/bot{TOKEN}/answerCallbackQuery"
+    payload = {'callback_query_id': callback_id, 'text': text}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except:
+        pass
+
+# ---------- КЛАВИАТУРЫ ----------
+def get_main_menu():
+    keyboard = [
+        ["📋 Сегодня", "📊 Статистика"],
+        ["🧘 Практики", "🎯 Стиль"],
+        ["⏸ Пауза", "❓ Помощь"],
     ]
-    if waiting:
-        main_menu.insert(0, ["✅ Выполнил(а) практику"])
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in main_menu],
+    return {
+        'keyboard': [[{'text': btn} for btn in row] for row in keyboard],
         'resize_keyboard': True,
         'one_time_keyboard': False
     }
-    send_keyboard(chat_id, text, keyboard)
 
-def show_submenu(chat_id, text):
-    keyboard = {
-        'keyboard': [[{'text': '🔙 Назад'}]],
+def get_resume_menu():
+    keyboard = [["▶️ Возобновить"]]
+    return {
+        'keyboard': [[{'text': btn} for btn in row] for row in keyboard],
         'resize_keyboard': True,
         'one_time_keyboard': True
     }
-    send_keyboard(chat_id, text, keyboard)
 
-# ──────────────────────────────────────────────────────────────
-# НАСТРОЙКИ
-# ──────────────────────────────────────────────────────────────
-def show_settings(chat_id, user):
-    text = "⚙️ *Настройки*\n\nВыберите раздел:"
-    buttons = [
-        ["🕒 Напоминания"],
-        ["📝 Задачи"],
-        ["🔙 Назад"]
+def get_report_menu():
+    keyboard = [
+        ["📝 Отчёт готов"],
+        ["📋 Сегодня", "⏸ Пауза"],
     ]
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
+    return {
+        'keyboard': [[{'text': btn} for btn in row] for row in keyboard],
         'resize_keyboard': True,
         'one_time_keyboard': True
     }
-    send_keyboard(chat_id, text, keyboard)
 
-def show_reminders_settings(chat_id, user):
-    name = user.get('character_name', 'Мини-Я')
-    morning = user.get('reminder_morning') or 'не установлено'
-    day = user.get('reminder_day') or 'не установлено'
-    evening = user.get('reminder_evening') or 'не установлено'
-    text = (
-        f"🕒 *Настройки напоминаний для {escape_markdown(name)}*\n\n"
-        f"🌅 Утро: {morning}\n"
-        f"☀️ День: {day}\n"
-        f"🌙 Вечер: {evening}\n\n"
-        "Выберите, что изменить:"
-    )
-    buttons = [
-        ["🕒 Утро", "🕒 День"],
-        ["🕒 Вечер", "❌ Отмена"],
-        ["🔙 Назад"]
-    ]
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-        'resize_keyboard': True,
-        'one_time_keyboard': True
-    }
-    send_keyboard(chat_id, text, keyboard)
+def get_practices_list_keyboard(user_id, show_all=False):
+    progress = get_user_progress(user_id)
+    keyboard = []
+    categories = {"morning": "🌅 Утренние", "evening": "🌙 Вечерние"}
+    for cat_key, cat_label in categories.items():
+        cat_practices = [p for p in PRACTICES if p["category"] == cat_key]
+        if not cat_practices:
+            continue
+        keyboard.append([{'text': f"━━ {cat_label} ━━", 'callback_data': 'noop'}])
+        for p in cat_practices:
+            pid = p["id"]
+            done = is_practice_done_today(progress, pid)
+            status = "✅" if done else "⬜"
+            if not show_all and done:
+                continue
+            keyboard.append([{'text': f"{status} {p['name']}", 'callback_data': f"practice_view:{pid}"}])
+    filter_label = "👁 Показать все" if not show_all else "👁 Только невыполненные"
+    filter_mode = "all" if not show_all else "todo"
+    keyboard.append([{'text': filter_label, 'callback_data': f"practices_toggle:{filter_mode}"}])
+    keyboard.append([{'text': "🔙 Назад в меню", 'callback_data': 'main_menu'}])
+    return {'inline_keyboard': keyboard}
 
-def show_tasks_settings(chat_id, user):
-    tasks = user.get('custom_tasks', [])
-    tasks_text = ""
-    if tasks:
-        for i, task in enumerate(tasks, 1):
-            tasks_text += f"{i}. {task['text']} в {task['time']}\n"
+def get_practice_detail_keyboard(pid, completed_today=False):
+    keyboard = []
+    if not completed_today:
+        keyboard.append([{'text': "✅ Отметить выполненной", 'callback_data': f"practice_done:{pid}"}])
     else:
-        tasks_text = "нет"
-    text = (
-        f"📝 *Ваши задачи*\n\n"
-        f"{tasks_text}\n"
-        "Что хотите сделать?"
-    )
+        keyboard.append([{'text': "↩️ Отменить выполнение", 'callback_data': f"practice_undo:{pid}"}])
+    keyboard.append([{'text': "🔙 К списку практик", 'callback_data': "practices_list"}])
+    return {'inline_keyboard': keyboard}
+
+def get_map_keyboard(options, prefix="map"):
+    buttons = [[{'text': opt, 'callback_data': f"{prefix}:{idx}"}] for idx, opt in enumerate(options)]
+    return {'inline_keyboard': buttons}
+
+def get_map_done_keyboard():
     buttons = [
-        ["➕ Добавить задачу"],
-        ["🗑 Удалить задачу"],
-        ["🔙 Назад"]
+        [{'text': "✅ Всё верно", 'callback_data': "map_done:ok"}],
+        [{'text': "🔄 Пройти заново", 'callback_data': "map_done:retry"}],
     ]
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-        'resize_keyboard': True,
-        'one_time_keyboard': True
-    }
-    send_keyboard(chat_id, text, keyboard)
+    return {'inline_keyboard': buttons}
 
-def add_task(chat_id, user_id, user, text):
-    # ожидаем текст задачи, затем время
-    save_user_field(user_id, 'temp_action', 'add_task')
-    save_user_field(user_id, 'temp_data', text)
-    send_message(chat_id, "✅ Текст задачи сохранён. Теперь введите время в формате ЧЧ:ММ (например, 14:00).")
+# ---------- ОБРАБОТЧИКИ ----------
+def handle_start(chat_id, user_id, username=None):
+    user = get_or_create_user(user_id, username)
+    name = user.get('name', 'Армен')
+    has_style = bool(user.get('archetype_profile'))
+    text = f"Привет, {name}.\n\nЯ — твое Второе Я. Не советчик, не мотиватор. Тот, кто следит за ритмом, когда ты сам забыл посмотреть на метроном.\n\nНиже — твои кнопки. Нажимай, не вспоминай команды.\n\n"
+    if not has_style:
+        text += "Советую начать с «Стиль» — так я буду говорить с тобой на одном языке."
+    send_keyboard(chat_id, text, get_main_menu())
 
-def delete_task(chat_id, user_id, user):
-    tasks = user.get('custom_tasks', [])
-    if not tasks:
-        send_message(chat_id, "У вас нет задач для удаления.")
-        show_tasks_settings(chat_id, user)
-        return
-    task_list = "\n".join([f"{i+1}. {task['text']} в {task['time']}" for i, task in enumerate(tasks)])
-    save_user_field(user_id, 'temp_action', 'delete_task')
-    send_message(chat_id, f"📝 *Ваши задачи:*\n\n{task_list}\n\nНапишите номер задачи, которую нужно удалить.")
+def handle_today(chat_id, user_id):
+    user = get_or_create_user(user_id)
+    profile = get_user_style(user_id)
+    core = profile.get("core", "Хозяин")
+    aff = get_affirmation_by_core(core)
+    blocks = get_blocks_for_profile(profile)
+    morning_blocks = blocks.get("morning", ["N-4", "N-5"])
+    reply = build_reply(morning_blocks, user_id, user.get('name', 'Армен'))
+    task = get_daily_task()
+    schedule = get_today_schedule()
+    schedule_text = ""
+    if schedule:
+        for period, practices in schedule.items():
+            if practices:
+                period_label = "🌅 Утро" if period == "morning" else "🌙 Вечер"
+                schedule_text += f"\n\n{period_label}:\n"
+                for p in practices:
+                    schedule_text += f"• {p['text']}\n"
+    if not schedule_text:
+        schedule_text = "\n\n📋 Сегодня выходной или программа ещё не запущена."
+    text = f"🌅 Доброе утро, Армен.\n\n💫 Аффирмация:\n{aff}\n\n🎯 Настройка дня:\n{reply}\n\n❗ Вот такое задание:\n{task}{schedule_text}"
+    send_keyboard(chat_id, text, get_main_menu())
 
-# ──────────────────────────────────────────────────────────────
-# ТЕСТ (ЛОГИКА)
-# ──────────────────────────────────────────────────────────────
-def start_test(chat_id, user_id):
-    save_user_field(user_id, 'test_answers', '[]')
-    save_user_field(user_id, 'game_status', 'testing')
-    show_test_question(chat_id, user_id, 0)
-
-def show_test_question(chat_id, user_id, index):
-    q = QUICK_TEST[index]
-    text = f"🧠 *Вопрос {index+1} из 12*\n\n{q['question']}"
-    buttons = [
-        [f"А: {q['option_a']}"],
-        [f"Б: {q['option_b']}"]
-    ]
-    control_buttons = []
-    if index > 0:
-        control_buttons.append("🔙 Назад")
-    control_buttons.append("🚪 Выйти из теста")
-    if control_buttons:
-        buttons.append(control_buttons)
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-        'resize_keyboard': True,
-        'one_time_keyboard': True
-    }
-    send_keyboard(chat_id, text, keyboard)
-
-def handle_test_answer(chat_id, user_id, user, text):
-    answers = user['test_answers']
-    current_index = len(answers)
-    if text == "🚪 Выйти из теста":
-        save_user_field(user_id, 'game_status', 'idle')
-        send_message(chat_id, "Тест прерван. Ты можешь начать его снова через /test.")
-        show_main_menu(chat_id, "Главное меню:")
-        return
-    if text == "🔙 Назад":
-        if current_index > 0:
-            answers.pop()
-            save_user_field(user_id, 'test_answers', answers)
-            show_test_question(chat_id, user_id, current_index - 1)
-        else:
-            save_user_field(user_id, 'game_status', 'idle')
-            send_message(chat_id, "Ты вернулся(ась) в главное меню.")
-            show_main_menu(chat_id, "Главное меню:")
-        return
-    if current_index >= 12:
-        finish_test(chat_id, user_id)
-        return
-    if text.startswith("А:") or text.startswith("А") or text.startswith("Б:") or text.startswith("Б"):
-        if text.startswith("А"):
-            answers.append(0)
-        else:
-            answers.append(1)
-        save_user_field(user_id, 'test_answers', answers)
-        next_index = len(answers)
-        if next_index >= 12:
-            finish_test(chat_id, user_id)
-        else:
-            show_test_question(chat_id, user_id, next_index)
-    else:
-        send_message(chat_id, "Пожалуйста, выбери вариант А или Б, нажав на кнопку.")
-
-def finish_test(chat_id, user_id):
+def handle_stats(chat_id, user_id):
     user = get_user(user_id)
-    answers = user['test_answers']
-    if len(answers) < 12:
-        send_message(chat_id, "Что-то пошло не так. Попробуй ещё раз через /test")
-        return
-    archetype = calculate_archetype(answers)
-    save_user_field(user_id, 'archetype', archetype)
-    # также сохраняем в quick_type для обратной совместимости
-    save_user_field(user_id, 'quick_type', archetype)
-    save_user_field(user_id, 'game_status', 'idle')
-    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
-    short_desc = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
-    # Краткое описание
-    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{short_desc}\n\nХочешь узнать больше? Нажми /archetype для полной интерпретации.")
-    show_main_menu(chat_id, "Главное меню:")
-
-def show_archetype(chat_id, user_id):
-    user = get_user(user_id)
-    archetype = get_user_archetype(user)
-    if not archetype:
-        send_message(chat_id, "Ты ещё не проходил(а) тест. Напиши /test, чтобы начать.")
-        return
-    # если архетип есть в старом поле, но не в archetype, копируем
-    if not user.get('archetype') and (user.get('quick_type') or user.get('primary_type')):
-        save_user_field(user_id, 'archetype', archetype)
-    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
-    full_desc = ARCHETYPE_FULL_DESC.get(archetype, "Полная интерпретация отсутствует.")
-    send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{full_desc}")
-
-# ──────────────────────────────────────────────────────────────
-# КОМНАТА (НОВЕЛЛА) – ИСПРАВЛЕННАЯ
-# ──────────────────────────────────────────────────────────────
-def handle_room(chat_id, user_id, user):
-    state = get_novel_state(user_id)
-    if state is None:
-        state = create_novel_state(user_id)
-    if state.get('completed', 0) == 1:
-        # финал
-        text = build_final_room(user, state)
-        send_message(chat_id, text)
-        keyboard = {
-            'inline_keyboard': [
-                [{'text': '💎 Купить продолжение (300 руб)', 'callback_data': 'buy_continuation'}],
-                [{'text': '🔙 Главное меню', 'callback_data': 'main_menu'}]
-            ]
-        }
-        send_keyboard(chat_id, "Хочешь узнать, что было дальше?", keyboard)
-        return
-    episode_id = state.get('episode', 0) + 1
-    if episode_id > 7:
-        state['completed'] = 1
-        save_novel_state(user_id, state)
-        handle_room(chat_id, user_id, user)
-        return
-    ep = get_episode(episode_id)
-    if not ep:
-        send_message(chat_id, "Ошибка: эпизод не найден.")
-        return
-    text = f"🚪 *Эпизод {episode_id} из 7: {ep['title']}*\n\n{ep['text']}"
-    # Формируем inline-клавиатуру в виде словаря
-    inline_keyboard = []
-    for idx, choice in enumerate(ep['choices']):
-        inline_keyboard.append([{'text': choice['text'], 'callback_data': f"novel_choice:{episode_id}:{idx}"}])
-    inline_keyboard.append([{'text': "🚪 Выйти из комнаты", 'callback_data': "exit_novel"}])
-    keyboard = {'inline_keyboard': inline_keyboard}
-    send_keyboard(chat_id, text, keyboard, parse_mode='Markdown')
-
-def handle_novel_choice(chat_id, user_id, episode_id, choice_idx):
-    state = get_novel_state(user_id)
-    if state is None:
-        state = create_novel_state(user_id)
-    ep = get_episode(episode_id)
-    if not ep:
-        send_message(chat_id, "Ошибка: эпизод не найден.")
-        return
-    choice = ep['choices'][choice_idx]
-    params = state.get('parameters', {})
-    for key, val in choice['effects'].items():
-        params[key] = params.get(key, 0) + val
-    state['parameters'] = params
-    choices = state.get('choices', [])
-    choices.append({"episode": episode_id, "choice": choice['text']})
-    state['choices'] = choices
-    state['episode'] = episode_id
-    save_novel_state(user_id, state)
-    send_message(chat_id, f"🌀 *Результат*\n\n{ep['neutral']}")
-    handle_room(chat_id, user_id, get_user(user_id))
-
-def exit_novel(chat_id, user_id):
-    send_message(chat_id, "Ты вышел(а) из Комнаты. Возвращайся, когда будешь готов(а)!")
-    show_main_menu(chat_id, "Главное меню:")
-
-def build_final_room(user, state):
-    params = state.get('parameters', {})
-    archetype = get_user_archetype(user)
-    if not archetype:
-        archetype = calculate_archetype_from_params(params)
-        save_user_field(user['user_id'], 'archetype', archetype)
-        save_user_field(user['user_id'], 'quick_type', archetype)
-    archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
-    description = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
-    phrases = user.get('key_phrases', [])
-    name = user.get('character_name', 'Мини-Я')
+    stats = user.get('stats', {})
+    reports = get_reports(user_id, 5)
+    profile = get_user_style(user_id)
+    core = profile.get("core", "—")
+    support = profile.get("support", "—")
+    shadow = profile.get("shadow", "—")
+    progress = user.get('practice_progress', {})
+    total_done = sum(p.get("completed_count", 0) for p in progress.values())
+    today_done = sum(1 for pid, p in progress.items() if is_practice_done_today(progress, pid))
     text = (
-        f"🏠 *Комната {escape_markdown(name)}*\n\n"
-        f"Ты прошёл(ла) все 7 эпизодов!\n\n"
-        f"Твой архетип — **{archetype_name}**.\n"
-        f"{description}\n\n"
-        f"Твои слова, которые остались со мной:\n"
+        f"📊 Твоя статистика, Армен\n\n"
+        f"Ядро: {core} | Опора: {support} | Тень: {shadow}\n"
+        f"Метафора: {get_metaphor_by_core(core)}\n"
+        f"Отчётов: {len(reports)}\n"
+        f"Утренних чек-инов: {stats.get('morning_checkin', 0)}\n"
+        f"Вечерних чек-инов: {stats.get('evening_checkin', 0)}\n"
+        f"Дней подряд: {stats.get('streak', 0)}\n\n"
+        f"🧘 Практики:\n"
+        f"• Всего выполнено: {total_done}\n"
+        f"• Сегодня выполнено: {today_done}\n"
     )
-    if phrases:
-        for i, phrase in enumerate(phrases, 1):
-            text += f"{i}. {escape_markdown(phrase)}\n"
+    send_keyboard(chat_id, text, get_main_menu())
+
+def handle_practices(chat_id, user_id, show_all=False):
+    user = get_or_create_user(user_id)
+    practices = PRACTICES
+    progress = get_user_progress(user_id)
+    todo_count = sum(1 for p in practices if not is_practice_done_today(progress, p["id"]))
+    header = "🧘 *Практики*\n\n"
+    if todo_count > 0 and not show_all:
+        header += f"Осталось на сегодня: *{todo_count}*\n\n"
     else:
-        text += "Ты не оставил(а) ни одной фразы, но твой выбор сказал больше слов."
-    text += "\n✨ Ты завершил(а) путешествие! Это только начало."
-    return text
+        header += f"Всего практик: *{len(practices)}*\n\n"
+    text = header + "Выберите практику:"
+    send_keyboard(chat_id, text, get_practices_list_keyboard(user_id, show_all), parse_mode='Markdown')
 
-# ──────────────────────────────────────────────────────────────
-# ОСНОВНАЯ ЛОГИКА
-# ──────────────────────────────────────────────────────────────
-@app.route('/')
-def index():
-    return "Бот 'Мини-Ты' работает! 🤖"
+def handle_style(chat_id, user_id):
+    global map_sessions
+    if 'map_sessions' not in globals():
+        map_sessions = {}
+    map_sessions[user_id] = {"answers": {}, "step": 0}
+    q_text, options = get_question_text(0)
+    keyboard = get_map_keyboard(options)
+    text = f"🗺 Карта архетипов — вопрос 1 из {len(MAP_QUESTIONS)}\n\n{q_text}"
+    send_keyboard(chat_id, text, keyboard)
 
+def get_question_text(step):
+    if step < 0 or step >= len(MAP_QUESTIONS):
+        return "", []
+    q = MAP_QUESTIONS[step]
+    options = [opt["label"] for opt in q["options"]]
+    return q["text"], options
+
+def handle_pause(chat_id, user_id):
+    save_user_field(user_id, 'paused', True)
+    send_keyboard(chat_id, "Программа приостановлена. Вернуться — нажми «Возобновить».", get_resume_menu())
+
+def handle_resume(chat_id, user_id):
+    save_user_field(user_id, 'paused', False)
+    send_keyboard(chat_id, "Программа возобновлена. Ритм восстановлен.", get_main_menu())
+
+def handle_help(chat_id):
+    text = """📖 Команды и кнопки:
+
+📋 Сегодня — расписание и утренняя точка
+📊 Статистика — твоя статистика
+🧘 Практики — список практик с отслеживанием
+🎯 Стиль — пройти Карту заново
+⏸ Пауза — остановить программу
+▶️ Возобновить — вернуться
+
+Также работают:
+/start — начать
+/today — расписание
+/stats — статистика
+/practices — практики
+/style — Карта архетипов
+/pause — пауза
+/resume — возобновить"""
+    send_keyboard(chat_id, text, get_main_menu())
+
+def handle_report(chat_id, user_id, text):
+    report_type = "general"
+    lower = text.lower()
+    if any(w in lower for w in ["утро", "morning", "план", "цель"]):
+        report_type = "morning"
+        user = get_user(user_id)
+        stats = user.get('stats', {})
+        stats['morning_checkin'] = stats.get('morning_checkin', 0) + 1
+        save_user_field(user_id, 'stats', stats)
+    elif any(w in lower for w in ["вечер", "evening", "итог", "сделал", "контролировал", "хозяин", "пожарный"]):
+        report_type = "evening"
+        user = get_user(user_id)
+        stats = user.get('stats', {})
+        stats['evening_checkin'] = stats.get('evening_checkin', 0) + 1
+        save_user_field(user_id, 'stats', stats)
+    save_report(user_id, report_type, text)
+    profile = get_user_style(user_id)
+    blocks = get_blocks_for_profile(profile)
+    if report_type == "morning":
+        reply_blocks = blocks.get("morning", ["N-4", "N-5"])
+    elif report_type == "evening":
+        reply_blocks = blocks.get("evening", ["N-1", "N-3"])
+    else:
+        reply_blocks = blocks.get("general", ["N-1"])
+    user = get_user(user_id)
+    reply = build_reply(reply_blocks, user_id, user.get('name', 'Армен'))
+    send_keyboard(chat_id, reply, get_main_menu())
+
+# ---------- ВЕБХУК ----------
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
         return "Webhook работает!"
     try:
         data = request.get_json()
-        logging.info(f"Получен запрос: {data}")
+        logger.info(f"Получен запрос: {data}")
         if data and 'callback_query' in data:
             callback = data['callback_query']
             chat_id = callback['message']['chat']['id']
             user_id = callback['from']['id']
             username = callback['from'].get('username')
             callback_data = callback['data']
+            callback_id = callback['id']
             user = get_or_create_user(user_id, username)
-            if callback_data.startswith('novel_choice:'):
-                parts = callback_data.split(':')
-                episode_id = int(parts[1])
-                choice_idx = int(parts[2])
-                handle_novel_choice(chat_id, user_id, episode_id, choice_idx)
+
+            # --- Карта архетипов ---
+            if callback_data.startswith('map:'):
+                idx_str = callback_data.split(':')[1]
+                try:
+                    idx = int(idx_str)
+                except:
+                    answer_callback(callback_id, "Ошибка")
+                    return 'ok', 200
+                if 'map_sessions' not in globals():
+                    map_sessions = {}
+                if user_id not in map_sessions:
+                    map_sessions[user_id] = {"answers": {}, "step": 0}
+                session = map_sessions[user_id]
+                step = session["step"]
+                if step < len(MAP_QUESTIONS):
+                    q = MAP_QUESTIONS[step]
+                    qid = q["id"]
+                    options = [opt["label"] for opt in q["options"]]
+                    if 0 <= idx < len(options):
+                        session["answers"][qid] = options[idx]
+                next_step = step + 1
+                session["step"] = next_step
+                if next_step < len(MAP_QUESTIONS):
+                    q_text, options = get_question_text(next_step)
+                    keyboard = get_map_keyboard(options)
+                    text = f"🗺 Карта архетипов — вопрос {next_step+1} из {len(MAP_QUESTIONS)}\n\n{q_text}"
+                    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                    payload = {
+                        'chat_id': chat_id,
+                        'message_id': callback['message']['message_id'],
+                        'text': text,
+                        'reply_markup': json.dumps(keyboard),
+                        'parse_mode': 'Markdown'
+                    }
+                    requests.post(url, json=payload, timeout=5)
+                    answer_callback(callback_id, "Выбор принят")
+                else:
+                    profile = calculate_profile(session["answers"])
+                    save_user_field(user_id, 'archetype_profile', profile)
+                    user_name = user.get('name', 'Армен')
+                    text = build_profile_text(profile, user_name)
+                    keyboard = get_map_done_keyboard()
+                    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                    payload = {
+                        'chat_id': chat_id,
+                        'message_id': callback['message']['message_id'],
+                        'text': text,
+                        'reply_markup': json.dumps(keyboard),
+                        'parse_mode': 'Markdown'
+                    }
+                    requests.post(url, json=payload, timeout=5)
+                    answer_callback(callback_id, "Профиль сохранён")
                 return 'ok', 200
-            elif callback_data == 'exit_novel':
-                exit_novel(chat_id, user_id)
+
+            elif callback_data.startswith('map_done:'):
+                action = callback_data.split(':')[1]
+                if action == 'ok':
+                    answer_callback(callback_id, "Профиль сохранён")
+                    send_message(chat_id, "Меню восстановлено.", reply_markup=get_main_menu())
+                elif action == 'retry':
+                    if 'map_sessions' not in globals():
+                        map_sessions = {}
+                    map_sessions[user_id] = {"answers": {}, "step": 0}
+                    q_text, options = get_question_text(0)
+                    keyboard = get_map_keyboard(options)
+                    text = f"🗺 Карта архетипов — вопрос 1 из {len(MAP_QUESTIONS)}\n\n{q_text}"
+                    url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                    payload = {
+                        'chat_id': chat_id,
+                        'message_id': callback['message']['message_id'],
+                        'text': text,
+                        'reply_markup': json.dumps(keyboard),
+                        'parse_mode': 'Markdown'
+                    }
+                    requests.post(url, json=payload, timeout=5)
+                    answer_callback(callback_id, "Перезапуск карты")
                 return 'ok', 200
-            elif callback_data == 'buy_continuation':
-                send_message(chat_id, "💎 Продолжение будет доступно после оплаты. Свяжись с администратором.")
+
+            elif callback_data == "main_menu":
+                answer_callback(callback_id, "Главное меню")
+                send_keyboard(chat_id, "Главное меню. Выберите действие:", get_main_menu())
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageReplyMarkup"
+                payload = {'chat_id': chat_id, 'message_id': callback['message']['message_id'], 'reply_markup': json.dumps({})}
+                try:
+                    requests.post(url, json=payload, timeout=5)
+                except:
+                    pass
                 return 'ok', 200
-            elif callback_data == 'main_menu':
-                show_main_menu(chat_id, "Главное меню:", waiting=user.get('waiting_for_practice', 0))
+
+            elif callback_data.startswith("practices_toggle:"):
+                show_mode = callback_data.split(":")[1]
+                show_all = (show_mode == "all")
+                if 'show_all_state' not in globals():
+                    show_all_state = {}
+                show_all_state[user_id] = show_all
+                practices = PRACTICES
+                progress = get_user_progress(user_id)
+                todo_count = sum(1 for p in practices if not is_practice_done_today(progress, p["id"]))
+                header = "🧘 *Практики*\n\n"
+                if todo_count > 0 and not show_all:
+                    header += f"Осталось на сегодня: *{todo_count}*\n\n"
+                else:
+                    header += f"Всего практик: *{len(practices)}*\n\n"
+                text = header + "Выберите практику:"
+                keyboard = get_practices_list_keyboard(user_id, show_all)
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                payload = {
+                    'chat_id': chat_id,
+                    'message_id': callback['message']['message_id'],
+                    'text': text,
+                    'reply_markup': json.dumps(keyboard),
+                    'parse_mode': 'Markdown'
+                }
+                requests.post(url, json=payload, timeout=5)
+                answer_callback(callback_id, "Обновлено")
                 return 'ok', 200
-            elif callback_data == 'start_game':
-                send_message(chat_id, "Отлично! Давай познакомимся. Как назовём твоего Мини-Ты? Напиши имя в ответ.")
+
+            elif callback_data == "practices_list":
+                show_all = False
+                if 'show_all_state' in globals() and user_id in show_all_state:
+                    show_all = show_all_state[user_id]
+                practices = PRACTICES
+                progress = get_user_progress(user_id)
+                todo_count = sum(1 for p in practices if not is_practice_done_today(progress, p["id"]))
+                header = "🧘 *Практики*\n\n"
+                if todo_count > 0 and not show_all:
+                    header += f"Осталось на сегодня: *{todo_count}*\n\n"
+                else:
+                    header += f"Всего практик: *{len(practices)}*\n\n"
+                text = header + "Выберите практику:"
+                keyboard = get_practices_list_keyboard(user_id, show_all)
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                payload = {
+                    'chat_id': chat_id,
+                    'message_id': callback['message']['message_id'],
+                    'text': text,
+                    'reply_markup': json.dumps(keyboard),
+                    'parse_mode': 'Markdown'
+                }
+                requests.post(url, json=payload, timeout=5)
+                answer_callback(callback_id, "Список практик")
                 return 'ok', 200
-            send_message(chat_id, "Команда выполнена.")
+
+            elif callback_data.startswith("practice_view:"):
+                pid = callback_data.split(":")[1]
+                practice = get_practice_by_id(pid)
+                if not practice:
+                    answer_callback(callback_id, "Практика не найдена")
+                    return 'ok', 200
+                progress = get_user_progress(user_id)
+                prog = progress.get(pid, {})
+                completed_count = prog.get("completed_count", 0)
+                streak = prog.get("streak", 0)
+                completed_today = is_practice_done_today(progress, pid)
+                status_emoji = "✅" if completed_today else "⬜"
+                text = (
+                    f"{status_emoji} *{practice['name']}*\n"
+                    f"_{practice['when']}_ | {practice['duration']}\n\n"
+                    f"{practice['text']}\n\n"
+                    f"📊 Статистика:\n"
+                    f"• Выполнено всего: {completed_count}\n"
+                    f"• Серия (streak): {streak}\n"
+                )
+                if prog.get("last_used"):
+                    text += f"• Последний раз: {prog['last_used'].split('T')[0]}\n"
+                keyboard = get_practice_detail_keyboard(pid, completed_today)
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                payload = {
+                    'chat_id': chat_id,
+                    'message_id': callback['message']['message_id'],
+                    'text': text,
+                    'reply_markup': json.dumps(keyboard),
+                    'parse_mode': 'Markdown'
+                }
+                requests.post(url, json=payload, timeout=5)
+                answer_callback(callback_id, "Подробнее")
+                return 'ok', 200
+
+            elif callback_data.startswith("practice_done:"):
+                pid = callback_data.split(":")[1]
+                mark_practice_done(user_id, pid)
+                answer_callback(callback_id, "✅ Отмечено!")
+                practice = get_practice_by_id(pid)
+                progress = get_user_progress(user_id)
+                prog = progress.get(pid, {})
+                completed_count = prog.get("completed_count", 0)
+                streak = prog.get("streak", 0)
+                completed_today = True
+                status_emoji = "✅"
+                text = (
+                    f"{status_emoji} *{practice['name']}* — выполнено!\n\n"
+                    f"{practice['text']}\n\n"
+                    f"📊 Статистика:\n"
+                    f"• Выполнено всего: {completed_count}\n"
+                    f"• Серия (streak): {streak}\n"
+                    f"• Последний раз: сегодня\n"
+                )
+                keyboard = get_practice_detail_keyboard(pid, completed_today)
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                payload = {
+                    'chat_id': chat_id,
+                    'message_id': callback['message']['message_id'],
+                    'text': text,
+                    'reply_markup': json.dumps(keyboard),
+                    'parse_mode': 'Markdown'
+                }
+                requests.post(url, json=payload, timeout=5)
+                return 'ok', 200
+
+            elif callback_data.startswith("practice_undo:"):
+                pid = callback_data.split(":")[1]
+                undo_practice_done(user_id, pid)
+                answer_callback(callback_id, "Отменено")
+                practice = get_practice_by_id(pid)
+                progress = get_user_progress(user_id)
+                prog = progress.get(pid, {})
+                completed_count = prog.get("completed_count", 0)
+                streak = prog.get("streak", 0)
+                completed_today = False
+                status_emoji = "⬜"
+                text = (
+                    f"{status_emoji} *{practice['name']}* — отменено\n\n"
+                    f"{practice['text']}\n\n"
+                    f"📊 Статистика:\n"
+                    f"• Выполнено всего: {completed_count}\n"
+                    f"• Серия (streak): {streak}\n"
+                )
+                keyboard = get_practice_detail_keyboard(pid, completed_today)
+                url = f"https://api.telegram.org/bot{TOKEN}/editMessageText"
+                payload = {
+                    'chat_id': chat_id,
+                    'message_id': callback['message']['message_id'],
+                    'text': text,
+                    'reply_markup': json.dumps(keyboard),
+                    'parse_mode': 'Markdown'
+                }
+                requests.post(url, json=payload, timeout=5)
+                return 'ok', 200
+
+            elif callback_data == "noop":
+                answer_callback(callback_id)
+                return 'ok', 200
+
+            answer_callback(callback_id, "Команда выполнена")
             return 'ok', 200
+
         if data and 'message' in data:
             msg = data['message']
             chat_id = msg['chat']['id']
@@ -1015,513 +1192,182 @@ def webhook():
             if not text or text.strip() == '':
                 send_message(chat_id, "Я не понимаю пустые сообщения. Напиши текст или выбери кнопку.")
                 return 'ok', 200
-            if re.match(r'^[\U0001F000-\U0001FFFF]+$', text.strip()):
-                send_message(chat_id, "Я не могу обработать только эмодзи. Напиши текст или выбери кнопку.")
-                return 'ok', 200
             user = get_or_create_user(user_id, username)
-            handle_message(chat_id, user_id, user, text)
+
+            paused = user.get('paused', False)
+            if paused and text not in ["▶️ Возобновить", "/resume"]:
+                send_keyboard(chat_id, "Программа на паузе. Нажми «▶️ Возобновить».", get_resume_menu())
+                return 'ok', 200
+
+            if text.startswith('/'):
+                if text == '/start':
+                    handle_start(chat_id, user_id, username)
+                elif text == '/today':
+                    handle_today(chat_id, user_id)
+                elif text == '/stats':
+                    handle_stats(chat_id, user_id)
+                elif text == '/practices':
+                    handle_practices(chat_id, user_id)
+                elif text == '/style':
+                    handle_style(chat_id, user_id)
+                elif text == '/pause':
+                    handle_pause(chat_id, user_id)
+                elif text == '/resume':
+                    handle_resume(chat_id, user_id)
+                elif text == '/help':
+                    handle_help(chat_id)
+                else:
+                    send_keyboard(chat_id, "Неизвестная команда. Используй кнопки меню.", get_main_menu())
+                return 'ok', 200
+
+            if text == "📋 Сегодня":
+                handle_today(chat_id, user_id)
+            elif text == "📊 Статистика":
+                handle_stats(chat_id, user_id)
+            elif text == "🧘 Практики":
+                handle_practices(chat_id, user_id)
+            elif text == "🎯 Стиль":
+                handle_style(chat_id, user_id)
+            elif text == "⏸ Пауза":
+                handle_pause(chat_id, user_id)
+            elif text == "▶️ Возобновить":
+                handle_resume(chat_id, user_id)
+            elif text == "❓ Помощь":
+                handle_help(chat_id)
+            elif text == "📝 Отчёт готов":
+                send_message(chat_id, "Напиши три строки:\n1. Что я контролировал сегодня?\n2. Был хозяином дня или пожарным?\n3. Что оставляю за дверью?\n\nИли просто напиши свои мысли — я услышу.")
+            else:
+                handle_report(chat_id, user_id, text)
         return 'ok', 200
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logger.error(f"Ошибка в webhook: {e}")
         return 'ok', 200
 
-def handle_message(chat_id, user_id, user, text):
-    status = user.get('game_status')
-    name = user.get('character_name', 'Мини-Я')
-    day = user.get('game_day', 0)
-    waiting = user.get('waiting_for_practice', 0)
-    temp_action = user.get('temp_action')
-    temp_data = user.get('temp_data')
-    
-    # Сброс temp_action при нажатии на кнопки навигации или "Отмена"
-    nav_buttons = ["🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", 
-                   "📊 Прогресс", "🧘 Практики", "⚙️ Настройки", "🔙 Назад", "❌ Отмена"]
-    if text in nav_buttons and temp_action:
-        save_user_field(user_id, 'temp_action', None)
-        save_user_field(user_id, 'temp_data', None)
-        temp_action = None
-        temp_data = None
-        user['temp_action'] = None
-        user['temp_data'] = None
-    
-    if status == 'not_started' and user.get('character_name') != 'Мини-Я':
-        save_user_field(user_id, 'game_status', 'idle')
-        status = 'idle'
-        user['game_status'] = 'idle'
-    
-    if text == '/reset_me':
-        delete_user(user_id)
-        send_message(chat_id, "🔄 Аккаунт полностью сброшен! Напиши /start, чтобы начать заново.")
-        return
-    
-    # НОВЫЙ ПОЛЬЗОВАТЕЛЬ
-    if status == 'not_started':
-        if text == '/start':
-            welcome_text = (
-                "👋 Привет! Я — твой Мини-Ты.\n"
-                "Я здесь, чтобы помочь тебе лучше понять себя.\n"
-                "Вместе мы пройдём путь, который поможет тебе увидеть свои сильные стороны, найти опору и услышать то, что внутри.\n\n"
-                "Вот что мы с тобой сделаем:\n\n"
-                "🧠 **Узнаем твой архетип** — твою суперсилу и зону роста.\n"
-                "📋 **Составим расписание** с практиками и аффирмациями на каждый день.\n"
-                "🚪 **Откроем Комнату** — 7 эпизодов, где ты будешь делать выбор и менять свой путь.\n"
-                "📊 **Будем смотреть прогресс** — чтобы тебе было видно, сколько уже пройдено.\n\n"
-                "Готов(а) заглянуть внутрь себя?\nНажми кнопку 👇"
-            )
-            keyboard = {
-                'inline_keyboard': [
-                    [{'text': '🚀 Начать', 'callback_data': 'start_game'}]
-                ]
-            }
-            send_keyboard(chat_id, welcome_text, keyboard)
+# ---------- ПЛАНИРОВЩИК ----------
+scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
+scheduler.start()
+
+def send_practice_reminder(practice_id):
+    try:
+        user = get_user(USER_ID)
+        if user is None or user.get('paused', False):
             return
-        name = text.strip()
-        if len(name) >= 2 and len(name) <= 20 and not text.startswith('/') and re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9\s\-]+$', name):
-            if re.match(r'^[\s\-]+$', name):
-                send_message(chat_id, "Имя не может состоять только из пробелов или дефисов. Напиши ещё раз.")
-                return
-            save_user_field(user_id, 'character_name', name)
-            save_user_field(user_id, 'game_status', 'idle')
-            safe_name = escape_markdown(name)
-            welcome_text = (
-                f"✅ Имя **{safe_name}** сохранено!\n\n"
-                f"Отлично! Теперь у тебя есть спутник — **{safe_name}**.\n\n"
-                "Я — твой помощник по самонаблюдению. Вот что я умею:\n\n"
-                "🧠 **Мой Архетип** — узнать свою суперсилу и зону роста.\n"
-                "📋 **Расписание** — практики и аффирмации на день.\n"
-                "🚪 **Комната** — 7 эпизодов с выбором.\n"
-                "🧘 **Практики** — отслеживай свои ритуалы.\n"
-                "📊 **Прогресс** — смотреть, сколько пройдено.\n\n"
-                "Выбирай, с чего начнём 👇\n\n"
-                "P.S. Я советую тебе сразу пройти тест на архетип, чтобы составить твою карту."
-            )
-            show_main_menu(chat_id, welcome_text)
+        practice = get_practice_by_id(practice_id)
+        if not practice:
             return
-        if len(name) < 2 and len(name) > 0 and not text.startswith('/') and text != '/start':
-            send_message(chat_id, "Имя должно состоять минимум из 2 символов. Попробуй ещё раз.")
+        progress = get_user_progress(USER_ID)
+        if is_practice_done_today(progress, practice_id):
             return
-        if len(name) > 20 and not text.startswith('/') and text != '/start':
-            send_message(chat_id, "Имя слишком длинное (максимум 20 символов). Попробуй короче.")
-            return
-        send_message(chat_id, "Чтобы начать, нажми '🚀 Начать' или напиши имя своего Мини-Ты.")
-        return
-    
-    # ОБРАБОТКА СОСТОЯНИЙ (FSM)
-    if temp_action:
-        if temp_action.startswith('set_'):
-            # установка времени напоминания
-            if text.lower() == 'отключить':
-                field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
-                save_user_field(user_id, field, None)
-                save_user_field(user_id, 'temp_action', None)
-                send_message(chat_id, f"🔕 Напоминание отключено.")
-                show_reminders_settings(chat_id, user)
-                return
-            if re.match(r'^\d{1,2}:\d{2}$', text.strip()):
-                field = {'set_morning': 'reminder_morning', 'set_day': 'reminder_day', 'set_evening': 'reminder_evening'}[temp_action]
-                save_user_field(user_id, field, text.strip())
-                save_user_field(user_id, 'temp_action', None)
-                period_name = {'set_morning': 'утро', 'set_day': 'день', 'set_evening': 'вечер'}[temp_action]
-                send_message(chat_id, f"✅ Время для {period_name} установлено на {text.strip()}")
-                show_reminders_settings(chat_id, user)
-                return
-            else:
-                send_message(chat_id, "❌ Неверный формат. Введи время в формате ЧЧ:ММ (например, 08:00) или 'отключить'.")
-                return
-        elif temp_action == 'delete_task':
-            if text.isdigit():
-                idx = int(text)
-                tasks = user.get('custom_tasks', [])
-                if 1 <= idx <= len(tasks):
-                    removed = tasks.pop(idx-1)
-                    save_user_field(user_id, 'custom_tasks', tasks)
-                    save_user_field(user_id, 'temp_action', None)
-                    send_message(chat_id, f"✅ Задача '{removed['text']}' удалена.")
-                    show_tasks_settings(chat_id, user)
-                    return
-                else:
-                    send_message(chat_id, "❌ Некорректный номер задачи. Попробуй ещё раз.")
-                    return
-            else:
-                send_message(chat_id, "❌ Введи номер задачи (цифру).")
-                return
-        elif temp_action == 'add_task':
-            if not temp_data:
-                # Текст задачи уже сохранён
-                save_user_field(user_id, 'temp_data', text)
-                send_message(chat_id, "✅ Текст задачи сохранён. Теперь введи время в формате ЧЧ:ММ (например, 14:00).")
-                return
-            else:
-                if re.match(r'^\d{1,2}:\d{2}$', text.strip()):
-                    task_text = temp_data
-                    tasks = user.get('custom_tasks', [])
-                    tasks.append({"text": task_text, "time": text.strip()})
-                    save_user_field(user_id, 'custom_tasks', tasks)
-                    save_user_field(user_id, 'temp_action', None)
-                    save_user_field(user_id, 'temp_data', None)
-                    send_message(chat_id, f"✅ Задача '{task_text}' в {text.strip()} добавлена.")
-                    show_tasks_settings(chat_id, user)
-                    return
-                else:
-                    send_message(chat_id, "❌ Неверный формат времени. Напиши ЧЧ:ММ (например, 14:00).")
-                    return
-    
-    # ЗАРЕГИСТРИРОВАННЫЙ ПОЛЬЗОВАТЕЛЬ
-    if text.startswith('/'):
-        if text == '/start':
-            if status == 'testing':
-                send_message(chat_id, "Ты проходишь тест! Продолжай отвечать на вопросы.")
-                return
-            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
-        elif text == '/test':
-            if status == 'testing':
-                send_message(chat_id, "Ты уже проходишь тест! Просто отвечай на вопросы.")
-                return
-            start_test(chat_id, user_id)
-        elif text == '/archetype':
-            show_archetype(chat_id, user_id)
-        elif text == '/room':
-            handle_room(chat_id, user_id, user)
-        elif text == '/menu':
-            show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
-        else:
-            show_main_menu(chat_id, "Неизвестная команда. Используй кнопки меню.", waiting=waiting)
-        return
-    
-    # КНОПКИ МЕНЮ
-    if text == "🔙 Назад":
-        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
-        return
-    if text == "🏠 Главная":
-        show_main_menu(chat_id, f"Главное меню, {escape_markdown(name)}:", waiting=waiting)
-        return
-    if text == "🧠 Мой Архетип":
-        show_archetype(chat_id, user_id)
-        return
-    if text == "📋 Расписание":
-        archetype = get_user_archetype(user)
-        if archetype:
-            sched = get_schedule(archetype)
-            name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
-            static_text = f"📋 *Расписание для архетипа «{name_archetype}»*\n\n"
-            for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
-                title, practice, affirmation = sched[period]
-                static_text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
-            # Добавляем задачи пользователя, если они есть
-            tasks = user.get('custom_tasks', [])
-            if tasks:
-                static_text += "📝 *Ваши задачи:*\n"
-                for task in tasks:
-                    static_text += f"• {task['text']} (в {task['time']})\n"
-            buttons = [["🔙 Назад"]]
-            if waiting:
-                buttons.append(["✅ Выполнил(а) практику"])
-            keyboard = {
-                'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-                'resize_keyboard': True,
-                'one_time_keyboard': True
-            }
-            send_keyboard(chat_id, static_text, keyboard)
-        else:
-            send_message(chat_id, "Сначала определи свой архетип через 🧠 Мой Архетип")
-        return
-    if text == "🚪 Комната":
-        handle_room(chat_id, user_id, user)
-        return
-    if text == "📊 Прогресс":
-        archetype = get_user_archetype(user)
-        archetype_name = ARCHETYPE_NAMES.get(archetype, 'не определён') if archetype else 'не определён'
-        phrases = user.get('key_phrases', [])
-        state = get_novel_state(user_id)
-        episode = state.get('episode', 0) if state else 0
-        completed = state.get('completed', 0) if state else 0
-        text = f"📊 *Твой прогресс*\n\n"
-        text += f"🧠 Архетип: {archetype_name}\n"
-        if completed:
-            text += f"🚪 Комната: завершена (7 из 7 эпизодов)\n"
-        else:
-            text += f"🚪 Комната: эпизод {episode} из 7\n"
-        text += f"📝 Собрано фраз: {len(phrases)}\n"
-        if phrases:
-            last_phrase = escape_markdown(phrases[-1])
-            text += f"🔄 Последняя фраза: {last_phrase}\n"
-        buttons = [["📖 История"], ["🔙 Назад"]]
+        text = (
+            f"🧘 *{practice['name']}*\n\n"
+            f"_{practice['when']}_ | {practice['duration']}\n\n"
+            f"{practice['text']}\n\n"
+            f"Нажми «✅ Сделано» или открой через «🧘 Практики»"
+        )
         keyboard = {
-            'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-            'resize_keyboard': True,
-            'one_time_keyboard': True
+            'inline_keyboard': [
+                [{'text': "✅ Сделано", 'callback_data': f"practice_done:{practice_id}"}],
+                [{'text': "📖 Подробнее", 'callback_data': f"practice_view:{practice_id}"}],
+            ]
         }
-        send_keyboard(chat_id, text, keyboard)
-        return
-    if text == "📖 История":
-        phrases = user.get('key_phrases', [])
-        if not phrases:
-            send_message(chat_id, "История пуста. Пройди Комнату, чтобы собрать свои фразы.")
+        send_keyboard(USER_ID, text, keyboard, parse_mode='Markdown')
+        logger.info(f"Пуш практики {practice_id} отправлен")
+    except Exception as e:
+        logger.error(f"Ошибка в send_practice_reminder({practice_id}): {e}")
+
+def scheduled_morning():
+    try:
+        user = get_user(USER_ID)
+        if user is None or user.get('paused', False):
+            return
+        chat_id = USER_ID
+        handle_today(chat_id, USER_ID)
+    except Exception as e:
+        logger.error(f"Ошибка в scheduled_morning: {e}")
+
+def scheduled_evening():
+    try:
+        user = get_user(USER_ID)
+        if user is None or user.get('paused', False):
+            return
+        chat_id = USER_ID
+        reports = get_reports(USER_ID, 1)
+        has_report = False
+        today = datetime.now().date().isoformat()
+        for r in reports:
+            if r['timestamp'].startswith(today) and r['report_type'] == 'evening':
+                has_report = True
+                break
+        profile = get_user_style(USER_ID)
+        blocks = get_blocks_for_profile(profile)
+        evening_blocks = blocks.get("evening", ["N-6", "N-7"])
+        reply = build_reply(evening_blocks, USER_ID, user.get('name', 'Армен'))
+        schedule = get_today_schedule()
+        evening_practices = schedule.get('evening', [])
+        practices_text = ""
+        if evening_practices:
+            practices_text = "\n\n📋 Вечерние практики:\n"
+            for p in evening_practices:
+                if p['key'] != 'вечерний_мини_отчёт':
+                    practices_text += f"• {p['text']}\n"
+        if not has_report:
+            text = (
+                f"🌙 Вечер, Армен.\n\n"
+                f"🎯 Подведение итогов:\n{reply}"
+                f"{practices_text}\n\n"
+                f"📝 Отчёт ещё не сделан. Нажми «📝 Отчёт готов» или просто напиши три строки."
+            )
+            send_keyboard(chat_id, text, get_report_menu())
         else:
-            hist = "📖 *Твоя история:*\n\n"
-            for i, phrase in enumerate(phrases, 1):
-                hist += f"{i}. {escape_markdown(phrase)}\n\n"
-            send_message(chat_id, hist)
-        show_submenu(chat_id, "Выбери действие:")
-        return
-    if text == "🧘 Практики":
-        archetype = get_user_archetype(user)
-        if archetype:
-            sched = get_schedule(archetype)
-            name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
-            text = f"🧘 *Практики для архетипа «{name_archetype}»*\n\n"
-            for period, label in [("morning", "🌅 Утро"), ("day", "☀️ День"), ("evening", "🌙 Вечер")]:
-                title, practice, affirmation = sched[period]
-                text += f"*{label}*\n📌 {practice}\n💬 _{affirmation}_\n\n"
-            # Пользовательские практики (если есть)
-            custom_practices = user.get('custom_practices', [])
-            if custom_practices:
-                text += "✏️ *Ваши практики:*\n"
-                for cp in custom_practices:
-                    text += f"• {cp}\n"
-            text += "\nЧтобы добавить свою практику, напишите в чат: 'Добавить практику: <текст>'"
-            show_submenu(chat_id, text)
-        else:
-            send_message(chat_id, "Сначала определи свой архетип.")
-        return
-    if text == "⚙️ Настройки":
-        show_settings(chat_id, user)
-        return
-    
-    # Обработка кнопок внутри настроек
-    if text == "🕒 Напоминания":
-        show_reminders_settings(chat_id, user)
-        return
-    if text == "📝 Задачи":
-        show_tasks_settings(chat_id, user)
-        return
-    if text == "🕒 Утро":
-        save_user_field(user_id, 'temp_action', 'set_morning')
-        send_message(chat_id, "Введи время для утренней практики в формате ЧЧ:ММ (например, 08:00) или 'отключить'.")
-        return
-    if text == "🕒 День":
-        save_user_field(user_id, 'temp_action', 'set_day')
-        send_message(chat_id, "Введи время для дневной практики в формате ЧЧ:ММ (например, 13:00) или 'отключить'.")
-        return
-    if text == "🕒 Вечер":
-        save_user_field(user_id, 'temp_action', 'set_evening')
-        send_message(chat_id, "Введи время для вечерней практики в формате ЧЧ:ММ (например, 21:00) или 'отключить'.")
-        return
-    if text == "➕ Добавить задачу":
-        save_user_field(user_id, 'temp_action', 'add_task')
-        save_user_field(user_id, 'temp_data', None)
-        send_message(chat_id, "Введи текст задачи (без времени). Затем я попрошу указать время.")
-        return
-    if text == "🗑 Удалить задачу":
-        delete_task(chat_id, user_id, user)
-        return
-    if text == "❌ Отмена":
-        # Просто сбрасываем и возвращаемся в настройки
-        save_user_field(user_id, 'temp_action', None)
-        save_user_field(user_id, 'temp_data', None)
-        show_settings(chat_id, user)
-        return
-    
-    # Обработка выполнения практики
-    if text and text.strip().startswith("✅") and "практику" in text.strip().lower():
-        logging.info(f"Нажата кнопка практики, waiting={waiting}, day={day}")
-        if waiting:
-            save_user_field(user_id, 'waiting_for_practice', 0)
-            save_user_field(user_id, 'practice_done', 1)
-            next_day = day + 1
-            if next_day <= 7:
-                can_proceed = True
-                last_date_str = user.get('last_day_completed_date')
-                if last_date_str:
-                    try:
-                        last_date = datetime.strptime(last_date_str, '%Y-%m-%d').date()
-                        today = date.today()
-                        if last_date >= today:
-                            can_proceed = False
-                    except:
-                        pass
-                if can_proceed:
-                    save_user_field(user_id, 'game_day', next_day)
-                    save_user_field(user_id, 'game_status', 'active')
-                    # Показываем старый вопрос дня (для обратной совместимости)
-                    from GAME_DAYS import get_game_day, show_game_question
-                    show_game_question(chat_id, user_id, next_day)
-                else:
-                    save_user_field(user_id, 'game_status', 'idle')
-                    send_message(chat_id, "✅ Отлично! Ты выполнил(а) практику, но следующий день откроется завтра.\nТы можешь пока посмотреть 📋 Расписание или 📊 Прогресс.")
-                    show_main_menu(chat_id, "Главное меню:", waiting=False)
-            else:
-                save_user_field(user_id, 'game_status', 'completed')
-                room_text = build_room(user)
-                send_message(chat_id, f"🎉 *Поздравляю!*\n\nТы прошёл(ла) все 7 дней!\n\n{room_text}")
-                show_main_menu(chat_id, "Главное меню:", waiting=False)
-        else:
-            send_message(chat_id, "Тебе не нужно отмечать практику прямо сейчас. Пройди день в Комнате, а затем выполни практику.")
-        return
-    
-    # Обработка старой комнаты (для совместимости)
-    if status == 'active':
-        handle_game_answer(chat_id, user_id, user, text)
-        return
-    if status == 'testing':
-        handle_test_answer(chat_id, user_id, user, text)
-        return
-    
-    # Если текст начинается с "Добавить практику:", сохраняем как пользовательскую практику
-    if text.lower().startswith('добавить практику:'):
-        practice_text = text[len('Добавить практику:'):].strip()
-        if practice_text:
-            custom_practices = user.get('custom_practices', [])
-            custom_practices.append(practice_text)
-            save_user_field(user_id, 'custom_practices', custom_practices)
-            send_message(chat_id, "✅ Практика добавлена!")
-        else:
-            send_message(chat_id, "❌ Не указан текст практики.")
-        show_main_menu(chat_id, "Главное меню:", waiting=waiting)
-        return
-    
-    # Неизвестный текст – сохраняем как фразу (если не "Отмена" и не пусто)
-    if text:
-        phrase = extract_key_phrase(text)
-        phrases = user.get('key_phrases', [])
-        phrases.append(phrase)
-        save_user_field(user_id, 'key_phrases', phrases)
-        send_message(chat_id, "📝 Я сохранил(а) твои мысли. Они войдут в историю твоего пути.")
-        show_main_menu(chat_id, "Главное меню:", waiting=waiting)
-    else:
-        send_message(chat_id, "Используй кнопки меню 👇")
-        show_main_menu(chat_id, "Главное меню:", waiting=waiting)
+            text = f"🌙 Вечер, Армен.\n\n🎯 {reply}{practices_text}\n\nОтчёт уже принят. Хорошего вечера."
+            send_keyboard(chat_id, text, get_main_menu())
+    except Exception as e:
+        logger.error(f"Ошибка в scheduled_evening: {e}")
 
-# ──────────────────────────────────────────────────────────────
-# СТАРАЯ ЛОГИКА КОМНАТЫ (для обратной совместимости)
-# ──────────────────────────────────────────────────────────────
-GAME_DAYS = {
-    1: {
-        "title": "Первый шаг",
-        "question": "Твой Мини-Ты смотрит на тебя и говорит: 'Я здесь, чтобы слушать тебя. Без оценок, без советов. Просто хочу знать, что внутри.'\n\nРасскажи мне: **как ты себя чувствуешь сегодня?**",
-        "response": "Я слышу. Это был первый уровень. Ты просто сказал(а) то, что есть. Иногда это самое сложное."
-    },
-    2: {
-        "title": "То, что внутри",
-        "question": "Твой Мини-Ты говорит: 'Есть вещи, которые мы носим внутри, но не говорим вслух. Они становятся тяжелее, когда мы их держим в себе.'\n\nРасскажи мне: **что ты держишь внутри — и что тебе хочется отпустить?**",
-        "response": "Ты говоришь о том, что тяжёлое. Это не слабость — это смелость. Второй уровень. Мы становимся ближе."
-    },
-    3: {
-        "title": "То, что наполняет",
-        "question": "Твой Мини-Ты говорит: 'Сегодня я хочу спросить о том, что наполняет. Ты знаешь, что есть моменты, когда ты чувствуешь себя живым(ой)?'\n\nРасскажи мне: **что сегодня заставило тебя почувствовать себя живым(ой)?**",
-        "response": "Ты говоришь о светлом. Третий уровень. Ты не только видишь сложное, но и замечаешь, что даёт тебе силу."
-    },
-    4: {
-        "title": "То, что ты боишься",
-        "question": "Твой Мини-Ты говорит: 'Но есть вещи, которые мы боимся сказать даже самим себе. Потому что страшно их признавать.'\n\nРасскажи мне: **чего ты боишься по-настоящему?**",
-        "response": "Ты сказал(а) это вслух. Твой страх потерял часть своей силы. Четвёртый уровень. Ты готов(а) смотреть в лицо тому, что пугает."
-    },
-    5: {
-        "title": "То, что ты хочешь",
-        "question": "Твой Мини-Ты говорит: 'Теперь я хочу спросить о том, что ты хочешь. Не о том, что 'надо', а о том, что ты действительно хочешь для себя.'\n\nРасскажи мне: **чего ты хочешь по-настоящему?**",
-        "response": "Ты говоришь о желаниях. Пятый уровень. Ты начинаешь отличать 'надо' от 'хочу'."
-    },
-    6: {
-        "title": "То, что ты можешь изменить",
-        "question": "Твой Мини-Ты говорит: 'Не всё в наших руках. Но что-то — точно. Ты знаешь, что это может быть?'\n\nРасскажи мне: **что в твоей жизни зависит от тебя — и ты готов(а) это изменить?**",
-        "response": "Ты говоришь о том, что в твоих руках. Шестой уровень. Ты видишь не только то, что есть, но и то, что может быть."
-    },
-    7: {
-        "title": "Комната",
-        "question": "Твой Мини-Ты говорит: 'Мы прошли 7 дней вместе. Сейчас я открою тебе Комнату, которую мы построили вместе. В ней — ты.'\n\nРасскажи мне: **что ты чувствуешь, глядя на этот путь?**",
-        "response": "Это был твой путь. Я просто был(а) рядом. Спасибо, что позволил(а) мне быть твоим Мини-Ты."
-    }
-}
+def setup_scheduler():
+    morning_time = get_user_setting(USER_ID, 'morning_time', '06:30')
+    h, m = morning_time.split(':')
+    scheduler.add_job(
+        scheduled_morning,
+        CronTrigger(hour=int(h), minute=int(m)),
+        id='morning_job',
+        replace_existing=True
+    )
+    evening_time = get_user_setting(USER_ID, 'evening_time', '23:00')
+    h, m = evening_time.split(':')
+    scheduler.add_job(
+        scheduled_evening,
+        CronTrigger(hour=int(h), minute=int(m)),
+        id='evening_job',
+        replace_existing=True
+    )
+    for p in PRACTICES:
+        pid = p['id']
+        if pid == 'P-3':
+            continue
+        schedule_time = p.get('schedule_time', '06:30')
+        days = p.get('schedule_days', [])
+        for day in days:
+            h, m = schedule_time.split(':')
+            job_id = f"practice_{pid}_day{day}"
+            scheduler.add_job(
+                send_practice_reminder,
+                CronTrigger(day_of_week=str(day), hour=int(h), minute=int(m)),
+                args=[pid],
+                id=job_id,
+                replace_existing=True
+            )
+    scheduler.add_job(
+        send_practice_reminder,
+        CronTrigger(day_of_week='0-6', hour=10, minute=30),
+        args=['P-3'],
+        id='practice_P-3_daily',
+        replace_existing=True
+    )
+    logger.info("Планировщик настроен.")
 
-def get_game_day(day):
-    return GAME_DAYS.get(day, GAME_DAYS[1])
-
-def show_game_question(chat_id, user_id, day):
-    day_data = get_game_day(day)
-    text = f"🚪 *День {day} из 7: {day_data['title']}*\n\n{day_data['question']}"
-    buttons = []
-    if day > 1:
-        buttons.append(["🔙 Назад"])
-    buttons.append(["🚪 Выйти из комнаты"])
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-        'resize_keyboard': True,
-        'one_time_keyboard': True
-    }
-    send_keyboard(chat_id, text, keyboard)
-
-def handle_game_answer(chat_id, user_id, user, text):
-    day = user.get('game_day', 0)
-    if text.startswith('/') or text in ["🔙 Назад", "🚪 Выйти из комнаты", "🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", "📊 Прогресс", "⚙️ Настройки"]:
-        return
-    day_data = get_game_day(day)
-    phrase = extract_key_phrase(text)
-    answers = user['game_answers']
-    answers.append(text)
-    save_user_field(user_id, 'game_answers', answers)
-    phrases = user['key_phrases']
-    phrases.append(phrase)
-    save_user_field(user_id, 'key_phrases', phrases)
-    next_day = day + 1
-    today_str = date.today().isoformat()
-    save_user_field(user_id, 'last_day_completed_date', today_str)
-    save_user_field(user_id, 'waiting_for_practice', 1)
-    save_user_field(user_id, 'game_status', 'idle')
-    if next_day > 7:
-        send_message(chat_id, f"✅ *День {day} завершён!*\n\n{day_data['response']}\n\n🎉 Ты прошёл(ла) все 7 дней! Осталось выполнить практику, чтобы завершить путешествие.")
-    else:
-        send_message(chat_id, f"✅ *День {day} завершён!*\n\n{day_data['response']}\n\n📅 *Завтра — День {next_day}.*\nЧтобы открыть следующий день, выполни практику из расписания и нажми '✅ Выполнил(а) практику'.\nНовый день откроется только завтра.")
-    show_main_menu(chat_id, "Главное меню:", waiting=True)
-
-# ──────────────────────────────────────────────────────────────
-# ПЛАНИРОВЩИК НАПОМИНАНИЙ (ВНУТРЕННИЙ)
-# ──────────────────────────────────────────────────────────────
-def reminder_worker():
-    while True:
-        try:
-            now = datetime.now(TZ) if TZ else datetime.now()
-            current_time = now.strftime("%H:%M")
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT * FROM users").fetchall()
-            conn.close()
-            for row in rows:
-                user = dict(row)
-                user_id = user['user_id']
-                chat_id = user_id
-                archetype = get_user_archetype(user)
-                if not archetype:
-                    continue
-                # Проверяем время напоминаний
-                for period, field in [("morning", "reminder_morning"), ("day", "reminder_day"), ("evening", "reminder_evening")]:
-                    reminder_time = user.get(field)
-                    if reminder_time and reminder_time == current_time:
-                        title, practice, affirmation = get_practice_text(archetype, period)
-                        if title:
-                            emoji = {"morning": "🌅", "day": "☀️", "evening": "🌙"}[period]
-                            send_message(chat_id,
-                                f"{emoji} *{title}*\n\n"
-                                f"📌 {practice}\n\n"
-                                f"💬 _{affirmation}_"
-                            )
-                # Проверяем задачи
-                custom_tasks = json.loads(user.get('custom_tasks', '[]'))
-                for task in custom_tasks:
-                    if task.get('time') == current_time:
-                        send_message(chat_id, f"⏰ *Напоминание*\n\n{task['text']}")
-            time.sleep(60)
-        except Exception as e:
-            logging.error(f"Reminder worker error: {e}")
-            time.sleep(60)
-
-# Запускаем поток планировщика
-thread = threading.Thread(target=reminder_worker, daemon=True)
-thread.start()
-
-# ──────────────────────────────────────────────────────────────
-# ЗАПУСК
-# ──────────────────────────────────────────────────────────────
+# ---------- ЗАПУСК ----------
 if __name__ == '__main__':
-    init_db()
+    setup_scheduler()
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
