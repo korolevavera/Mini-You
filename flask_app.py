@@ -873,7 +873,7 @@ def show_archetype(chat_id, user_id):
     send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{full_desc}")
 
 # ──────────────────────────────────────────────────────────────
-# КОМНАТА (НОВЕЛЛА)
+# КОМНАТА (НОВЕЛЛА) – ИСПРАВЛЕННАЯ
 # ──────────────────────────────────────────────────────────────
 def handle_room(chat_id, user_id, user):
     state = get_novel_state(user_id)
@@ -902,12 +902,12 @@ def handle_room(chat_id, user_id, user):
         send_message(chat_id, "Ошибка: эпизод не найден.")
         return
     text = f"🚪 *Эпизод {episode_id} из 7: {ep['title']}*\n\n{ep['text']}"
-    buttons = []
+    # Формируем inline-клавиатуру в виде словаря
+    inline_keyboard = []
     for idx, choice in enumerate(ep['choices']):
-        callback_data = f"novel_choice:{episode_id}:{idx}"
-        buttons.append([InlineKeyboardButton(choice['text'], callback_data=callback_data)])
-    buttons.append([InlineKeyboardButton("🚪 Выйти из комнаты", callback_data="exit_novel")])
-    keyboard = InlineKeyboardMarkup(buttons)
+        inline_keyboard.append([{'text': choice['text'], 'callback_data': f"novel_choice:{episode_id}:{idx}"}])
+    inline_keyboard.append([{'text': "🚪 Выйти из комнаты", 'callback_data': "exit_novel"}])
+    keyboard = {'inline_keyboard': inline_keyboard}
     send_keyboard(chat_id, text, keyboard, parse_mode='Markdown')
 
 def handle_novel_choice(chat_id, user_id, episode_id, choice_idx):
