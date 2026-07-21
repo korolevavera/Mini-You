@@ -37,6 +37,8 @@ def init_db():
             username TEXT,
             character_name TEXT DEFAULT 'Мини-Я',
             archetype TEXT,
+            quick_type TEXT,
+            primary_type TEXT,
             game_status TEXT DEFAULT 'not_started',
             test_answers TEXT DEFAULT '[]',
             game_day INTEGER DEFAULT 0,
@@ -67,6 +69,9 @@ def init_db():
             updated_at TEXT DEFAULT (datetime('now'))
         )
     ''')
+    # Миграция: копируем quick_type и primary_type в archetype, если поле archetype пустое
+    conn.execute("UPDATE users SET archetype = quick_type WHERE archetype IS NULL AND quick_type IS NOT NULL")
+    conn.execute("UPDATE users SET archetype = primary_type WHERE archetype IS NULL AND primary_type IS NOT NULL")
     conn.commit()
     conn.close()
 
@@ -113,6 +118,13 @@ def delete_user(user_id):
     conn.commit()
     conn.close()
     logging.info(f"User {user_id} deleted")
+
+# ──────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ПОЛУЧЕНИЯ АРХЕТИПА (с fallback)
+# ──────────────────────────────────────────────────────────────
+def get_user_archetype(user):
+    """Возвращает архетип пользователя из любого доступного поля."""
+    return user.get('archetype') or user.get('quick_type') or user.get('primary_type')
 
 # ──────────────────────────────────────────────────────────────
 # НОВЕЛЛА (7 эпизодов)
@@ -606,7 +618,7 @@ def extract_key_phrase(text):
 def build_room(user):
     phrases = user.get('key_phrases', [])
     name = user.get('character_name', 'Мини-Я')
-    archetype_code = user.get('archetype', '')
+    archetype_code = get_user_archetype(user) or ''
     archetype_name = ARCHETYPE_NAMES.get(archetype_code, 'Человек')
     if not phrases:
         return f"🏠 *Комната {escape_markdown(name)}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
@@ -666,7 +678,7 @@ def show_main_menu(chat_id, text, waiting=False):
         ["🏠 Главная", "🧠 Мой Архетип"],
         ["📋 Расписание", "🚪 Комната"],
         ["📊 Прогресс", "🧘 Практики"],
-        ["⚙️ Настройki"]
+        ["⚙️ Настройки"]
     ]
     if waiting:
         main_menu.insert(0, ["✅ Выполнил(а) практику"])
@@ -838,6 +850,8 @@ def finish_test(chat_id, user_id):
         return
     archetype = calculate_archetype(answers)
     save_user_field(user_id, 'archetype', archetype)
+    # также сохраняем в quick_type для обратной совместимости
+    save_user_field(user_id, 'quick_type', archetype)
     save_user_field(user_id, 'game_status', 'idle')
     archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
     short_desc = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
@@ -847,10 +861,13 @@ def finish_test(chat_id, user_id):
 
 def show_archetype(chat_id, user_id):
     user = get_user(user_id)
-    archetype = user.get('archetype')
+    archetype = get_user_archetype(user)
     if not archetype:
         send_message(chat_id, "Ты ещё не проходил(а) тест. Напиши /test, чтобы начать.")
         return
+    # если архетип есть в старом поле, но не в archetype, копируем
+    if not user.get('archetype') and (user.get('quick_type') or user.get('primary_type')):
+        save_user_field(user_id, 'archetype', archetype)
     archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
     full_desc = ARCHETYPE_FULL_DESC.get(archetype, "Полная интерпретация отсутствует.")
     send_message(chat_id, f"🧠 *Твой архетип — {archetype_name}*\n\n{full_desc}")
@@ -920,10 +937,11 @@ def exit_novel(chat_id, user_id):
 
 def build_final_room(user, state):
     params = state.get('parameters', {})
-    archetype = user.get('archetype')
+    archetype = get_user_archetype(user)
     if not archetype:
         archetype = calculate_archetype_from_params(params)
         save_user_field(user['user_id'], 'archetype', archetype)
+        save_user_field(user['user_id'], 'quick_type', archetype)
     archetype_name = ARCHETYPE_NAMES.get(archetype, "Человек")
     description = ARCHETYPE_SHORT_DESC.get(archetype, "Твой уникальный архетип.")
     phrases = user.get('key_phrases', [])
@@ -1181,7 +1199,7 @@ def handle_message(chat_id, user_id, user, text):
         show_archetype(chat_id, user_id)
         return
     if text == "📋 Расписание":
-        archetype = user.get('archetype')
+        archetype = get_user_archetype(user)
         if archetype:
             sched = get_schedule(archetype)
             name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
@@ -1211,7 +1229,7 @@ def handle_message(chat_id, user_id, user, text):
         handle_room(chat_id, user_id, user)
         return
     if text == "📊 Прогресс":
-        archetype = user.get('archetype')
+        archetype = get_user_archetype(user)
         archetype_name = ARCHETYPE_NAMES.get(archetype, 'не определён') if archetype else 'не определён'
         phrases = user.get('key_phrases', [])
         state = get_novel_state(user_id)
@@ -1247,7 +1265,7 @@ def handle_message(chat_id, user_id, user, text):
         show_submenu(chat_id, "Выбери действие:")
         return
     if text == "🧘 Практики":
-        archetype = user.get('archetype')
+        archetype = get_user_archetype(user)
         if archetype:
             sched = get_schedule(archetype)
             name_archetype = ARCHETYPE_NAMES.get(archetype, archetype)
@@ -1326,8 +1344,6 @@ def handle_message(chat_id, user_id, user, text):
                     save_user_field(user_id, 'game_day', next_day)
                     save_user_field(user_id, 'game_status', 'active')
                     # Показываем старый вопрос дня (для обратной совместимости)
-                    # В новой версии мы используем новеллу, поэтому этот код почти не используется,
-                    # но оставляем для совместимости.
                     from GAME_DAYS import get_game_day, show_game_question
                     show_game_question(chat_id, user_id, next_day)
                 else:
@@ -1473,7 +1489,7 @@ def reminder_worker():
                 user = dict(row)
                 user_id = user['user_id']
                 chat_id = user_id
-                archetype = user.get('archetype')
+                archetype = get_user_archetype(user)
                 if not archetype:
                     continue
                 # Проверяем время напоминаний
