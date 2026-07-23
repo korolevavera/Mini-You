@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from flask import Flask, request
 import requests
 import psycopg2
@@ -62,14 +62,6 @@ def init_db():
                 user_id BIGINT PRIMARY KEY,
                 morning_time TEXT DEFAULT '06:30',
                 evening_time TEXT DEFAULT '23:00'
-            )
-        ''')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS user_messages (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                message TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
@@ -179,45 +171,6 @@ PRACTICES = [
      "text": "Напиши три строки:\n1. Что я контролировал сегодня?\n2. Был хозяином дня или пожарным?\n3. Что оставляю за дверью?"},
 ]
 
-# ---------- ДНИ (КОМНАТА) ----------
-GAME_DAYS = {
-    1: {
-        "title": "Первый шаг",
-        "question": "Твой Мини-Ты смотрит на тебя и говорит: 'Я здесь, чтобы слушать тебя. Без оценок, без советов. Просто хочу знать, что внутри.'\n\nРасскажи мне: **как ты себя чувствуешь сегодня?**",
-        "response": "Я слышу. Это был первый уровень. Ты просто сказал(а) то, что есть. Иногда это самое сложное."
-    },
-    2: {
-        "title": "То, что внутри",
-        "question": "Твой Мини-Ты говорит: 'Есть вещи, которые мы носим внутри, но не говорим вслух. Они становятся тяжелее, когда мы их держим в себе.'\n\nРасскажи мне: **что ты держишь внутри — и что тебе хочется отпустить?**",
-        "response": "Ты говоришь о том, что тяжёлое. Это не слабость — это смелость. Второй уровень. Мы становимся ближе."
-    },
-    3: {
-        "title": "То, что наполняет",
-        "question": "Твой Мини-Ты говорит: 'Сегодня я хочу спросить о том, что наполняет. Ты знаешь, что есть моменты, когда ты чувствуешь себя живым(ой)?'\n\nРасскажи мне: **что сегодня заставило тебя почувствовать себя живым(ой)?**",
-        "response": "Ты говоришь о светлом. Третий уровень. Ты не только видишь сложное, но и замечаешь, что даёт тебе силу."
-    },
-    4: {
-        "title": "То, что ты боишься",
-        "question": "Твой Мини-Ты говорит: 'Но есть вещи, которые мы боимся сказать даже самим себе. Потому что страшно их признавать.'\n\nРасскажи мне: **чего ты боишься по-настоящему?**",
-        "response": "Ты сказал(а) это вслух. Твой страх потерял часть своей силы. Четвёртый уровень. Ты готов(а) смотреть в лицо тому, что пугает."
-    },
-    5: {
-        "title": "То, что ты хочешь",
-        "question": "Твой Мини-Ты говорит: 'Теперь я хочу спросить о том, что ты хочешь. Не о том, что 'надо', а о том, что ты действительно хочешь для себя.'\n\nРасскажи мне: **чего ты хочешь по-настоящему?**",
-        "response": "Ты говоришь о желаниях. Пятый уровень. Ты начинаешь отличать 'надо' от 'хочу'."
-    },
-    6: {
-        "title": "То, что ты можешь изменить",
-        "question": "Твой Мини-Ты говорит: 'Не всё в наших руках. Но что-то — точно. Ты знаешь, что это может быть?'\n\nРасскажи мне: **что в твоей жизни зависит от тебя — и ты готов(а) это изменить?**",
-        "response": "Ты говоришь о том, что в твоих руках. Шестой уровень. Ты видишь не только то, что есть, но и то, что может быть."
-    },
-    7: {
-        "title": "Комната",
-        "question": "Твой Мини-Ты говорит: 'Мы прошли 7 дней вместе. Сейчас я открою тебе Комнату, которую мы построили вместе. В ней — ты.'\n\nРасскажи мне: **что ты чувствуешь, глядя на этот путь?**",
-        "response": "Это был твой путь. Я просто был(а) рядом. Спасибо, что позволил(а) мне быть твоим Мини-Ты."
-    }
-}
-
 BLOCKS = [
     {"id": "N-1", "text": "Твоё Второе Я — единственный на сцене, кто держит тишину между нотами."},
     {"id": "N-2", "text": "Ты не должен быть всем — ты должен быть собой. Это уже достаточно."},
@@ -320,68 +273,6 @@ def build_reply(block_ids, user_id):
         parts.append(text)
     return '\n\n'.join(parts)
 
-def get_game_day(day):
-    return GAME_DAYS.get(day, GAME_DAYS[1])
-
-def show_game_question(chat_id, user_id, day):
-    day_data = get_game_day(day)
-    text = f"🚪 *День {day} из 7: {day_data['title']}*\n\n{day_data['question']}"
-    buttons = []
-    if day > 1:
-        buttons.append(["🔙 Назад"])
-    buttons.append(["🚪 Выйти из комнаты"])
-    keyboard = {
-        'keyboard': [[{'text': btn} for btn in row] for row in buttons],
-        'resize_keyboard': True,
-        'one_time_keyboard': True
-    }
-    send_keyboard(chat_id, text, keyboard)
-
-def handle_game_answer(chat_id, user_id, user, text):
-    day = user.get('game_day', 0)
-    if text.startswith('/') or text in ["🔙 Назад", "🚪 Выйти из комнаты", "🏠 Главная", "🧠 Мой Архетип", "📋 Расписание", "🚪 Комната", "📊 Прогресс", "⚙️ Настройки"]:
-        return
-    day_data = get_game_day(day)
-    phrase = extract_key_phrase(text)
-    answers = user['game_answers']
-    answers.append(text)
-    save_user_field(user_id, 'game_answers', answers)
-    phrases = user['key_phrases']
-    phrases.append(phrase)
-    save_user_field(user_id, 'key_phrases', phrases)
-    next_day = day + 1
-    today_str = date.today().isoformat()
-    save_user_field(user_id, 'last_day_completed_date', today_str)
-    save_user_field(user_id, 'waiting_for_practice', 1)
-    save_user_field(user_id, 'game_status', 'idle')
-    if next_day > 7:
-        send_message(chat_id, f"✅ *День {day} завершён!*\n\n{day_data['response']}\n\n🎉 Ты прошёл(ла) все 7 дней! Осталось выполнить практику, чтобы завершить путешествие.")
-        deep_text = "🧠 Хочешь узнать свой глубинный архетип? Пройди **Глубокий тест** — 3 вопроса, которые раскроют твоё Ядро, Опора и Тень.\nНажми /deep или выбери в настройках."
-        send_message(chat_id, deep_text)
-    else:
-        send_message(chat_id, f"✅ *День {day} завершён!*\n\n{day_data['response']}\n\n📅 *Завтра — День {next_day}.*\nЧтобы открыть следующий день, выполни практику из расписания и нажми '✅ Выполнил(а) практику'.\nНовый день откроется только завтра.")
-    show_main_menu(chat_id, "Главное меню:", waiting=True, paused=user.get('paused', 0))
-
-def build_room(user):
-    phrases = user.get('key_phrases', [])
-    name = user.get('character_name', 'Мини-Я')
-    archetype_code = user.get('archetype', '')
-    archetype_name = get_archetype_name(archetype_code)
-    if not phrases:
-        return f"🏠 *Комната {escape_markdown(name)}*\n\nТы ещё не прошёл(а) ни одного дня. Начни путешествие!"
-    text = f"🏠 *Комната {escape_markdown(name)}*\n\n"
-    text += f"Ты — {archetype_name}. Ты прошёл(ла) {len(phrases)} из 7 дней.\n\n"
-    text += "Твои слова, которые остались со мной:\n\n"
-    for i, phrase in enumerate(phrases, 1):
-        text += f"{i}. {escape_markdown(phrase)}\n"
-    if len(phrases) >= 7:
-        text += "\n✨ Ты завершил(а) путешествие! Комната наполнилась твоими голосами."
-    return text
-
-def show_room(chat_id, user):
-    room_text = build_room(user)
-    send_message(chat_id, room_text)
-
 # ---------- ОТПРАВКА СООБЩЕНИЙ ----------
 def send_message(chat_id, text, keyboard=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -408,8 +299,7 @@ def get_main_menu():
     keyboard = [
         [{"text": "📋 Сегодня"}, {"text": "📊 Статистика"}],
         [{"text": "🧘 Практики"}, {"text": "🎯 Стиль"}],
-        [{"text": "📖 История"}, {"text": "⏸ Пауза"}],
-        [{"text": "❓ Помощь"}],
+        [{"text": "⏸ Пауза"}, {"text": "❓ Помощь"}],
     ]
     return {'keyboard': keyboard, 'resize_keyboard': True}
 
@@ -427,58 +317,10 @@ def get_practice_keyboard(practices, user_id):
             done = last.startswith(datetime.now().date().isoformat())
         status = "✅" if done else "⬜"
         keyboard.append([{"text": f"{status} {p['name']}", "callback_data": f"practice_view:{p['id']}"}])
-    return {'inline_keyboard': buttons}
-
-# ---------- ИСТОРИЯ ----------
-def handle_history(chat_id, user_id):
-    conn = get_db_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
-        rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
-        send_keyboard(chat_id, "Главное меню:", get_main_menu())
-        return
-
-    history_text = "📖 *Твоя полная история:*\n\n"
-    for row in rows:
-        date = row['timestamp'].strftime('%d.%m.%Y %H:%M')
-        history_text += f"*{date}*\n{row['message']}\n\n"
-        history_text += "—" * 30 + "\n\n"
-
-    if len(history_text) > 4000:
-        parts = []
-        current_part = ""
-        for row in rows:
-            date = row['timestamp'].strftime('%d.%m.%Y %H:%M')
-            block = f"*{date}*\n{row['message']}\n\n" + "—" * 30 + "\n\n"
-            if len(current_part) + len(block) > 4000:
-                parts.append(current_part)
-                current_part = block
-            else:
-                current_part += block
-        if current_part:
-            parts.append(current_part)
-
-        for i, part in enumerate(parts):
-            if i == 0:
-                send_message(chat_id, f"📖 *Твоя история (часть {i+1}/{len(parts)}):*\n\n{part}")
-            else:
-                send_message(chat_id, f"📖 *Продолжение (часть {i+1}/{len(parts)}):*\n\n{part}")
-    else:
-        send_message(chat_id, history_text)
-
-    send_keyboard(chat_id, "Главное меню:", get_main_menu())
+    return {'inline_keyboard': keyboard}
 
 # ---------- ОБРАБОТЧИКИ ----------
 def handle_start(chat_id, user_id):
-    # Снимаем паузу, если она была
-    user = get_user(user_id)
-    if user and user.get('paused', False):
-        save_user_field(user_id, 'paused', False)
-    
     user = get_or_create_user(user_id)
     name = user.get('name', 'Армен')
     text = f"Привет, {name}!\n\nЯ — твое Второе Я. Я здесь, чтобы помочь тебе следить за ритмом.\n\nИспользуй кнопки ниже 👇"
@@ -684,21 +526,12 @@ def webhook():
                 handle_style(chat_id, user_id)
             elif text == "⏸ Пауза":
                 handle_pause(chat_id, user_id)
-            elif text == "📖 История":
-                handle_history(chat_id, user_id)
             elif text == "▶️ Возобновить":
                 handle_resume(chat_id, user_id)
             elif text == "❓ Помощь":
                 handle_help(chat_id)
             else:
-                # Сохраняем сообщение в БД
-                conn = get_db_connection()
-                with conn.cursor() as cur:
-                    cur.execute("INSERT INTO user_messages (user_id, message) VALUES (%s, %s)", (user_id, text))
-                    conn.commit()
-                conn.close()
-
-                # Сохраняем статистику
+                # Сохраняем как отчёт
                 save_user_field(user_id, 'stats', {**user.get('stats', {}), 'reports': user.get('stats', {}).get('reports', 0) + 1})
                 send_message(chat_id, "📝 Сохранил твои мысли. Спасибо!")
                 send_keyboard(chat_id, "Главное меню:", get_main_menu())
