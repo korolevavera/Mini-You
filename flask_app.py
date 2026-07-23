@@ -507,14 +507,29 @@ def show_test_question(chat_id, user_id, index):
     }
     send_keyboard(chat_id, text, keyboard)
 
+# 🔥 ИСПРАВЛЕННАЯ ФУНКЦИЯ
 def handle_test_answer(chat_id, user_id, user, text):
-    answers = json.loads(user.get('test_answers', '[]'))
+    # Получаем данные из базы
+    raw_answers = user.get('test_answers', '[]')
+    
+    # Если это уже список - используем его
+    if isinstance(raw_answers, list):
+        answers = raw_answers
+    else:
+        # Если это строка - парсим JSON
+        try:
+            answers = json.loads(raw_answers) if raw_answers else []
+        except:
+            answers = []
+    
     current_index = len(answers)
+    
     if text == "🚪 Выйти из теста":
         save_user_field(user_id, 'game_status', 'idle')
         send_message(chat_id, "Тест прерван. Ты можешь начать его снова через /test.")
         show_main_menu(chat_id, "Главное меню:")
         return
+    
     if text == "🔙 Назад":
         if current_index > 0:
             answers.pop()
@@ -525,9 +540,11 @@ def handle_test_answer(chat_id, user_id, user, text):
             send_message(chat_id, "Ты вернулся(ась) в главное меню.")
             show_main_menu(chat_id, "Главное меню:")
         return
+    
     if current_index >= 12:
         finish_test(chat_id, user_id)
         return
+    
     if text.startswith("А:") or text.startswith("А") or text.startswith("Б:") or text.startswith("Б"):
         if text.startswith("А"):
             answers.append(0)
