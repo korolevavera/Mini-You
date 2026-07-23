@@ -329,16 +329,6 @@ def get_practice_keyboard(practices, user_id):
     return {'inline_keyboard': keyboard}
 
 # ---------- ОБРАБОТЧИКИ ----------
-def handle_history(chat_id, user_id):
-    conn = get_db_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
-        rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
-        send_keyboard(chat_id, "Главное меню:", get_main_menu())
 def handle_start(chat_id, user_id):
     user = get_or_create_user(user_id)
     name = user.get('name', 'Армен')
@@ -400,15 +390,26 @@ def handle_resume(chat_id, user_id):
 def handle_help(chat_id):
     text = "📖 Помощь\n\n📋 Сегодня — расписание\n📊 Статистика — твои данные\n🧘 Практики — список практик\n🎯 Стиль — карта архетипов\n⏸ Пауза — остановить\n▶️ Возобновить — продолжить"
     send_keyboard(chat_id, text, get_main_menu())
-    
-    return
+
+# ---------- ОТДЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ИСТОРИИ (ИСПРАВЛЕНО) ----------
+def handle_history(chat_id, user_id):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
+        rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
+        send_keyboard(chat_id, "Главное меню:", get_main_menu())
+        return  # <-- ВАЖНО: возврат, чтобы не идти дальше
 
     history_text = "📖 *Твоя полная история:*\n\n"
     for row in rows:
         date = row['timestamp'].strftime('%d.%m.%Y %H:%M')
         history_text += f"*{date}*\n{row['message']}\n\n"
         history_text += "—" * 30 + "\n\n"
-    
+
     if len(history_text) > 4000:
         parts = []
         current_part = ""
@@ -422,7 +423,7 @@ def handle_help(chat_id):
                 current_part += block
         if current_part:
             parts.append(current_part)
-        
+
         for i, part in enumerate(parts):
             if i == 0:
                 send_message(chat_id, f"📖 *Твоя история (часть {i+1}/{len(parts)}):*\n\n{part}")
@@ -430,7 +431,7 @@ def handle_help(chat_id):
                 send_message(chat_id, f"📖 *Продолжение (часть {i+1}/{len(parts)}):*\n\n{part}")
     else:
         send_message(chat_id, history_text)
-    
+
     send_keyboard(chat_id, "Главное меню:", get_main_menu())
 
 # ---------- ВЕБХУК ----------
@@ -578,7 +579,7 @@ def webhook():
             elif text == "⏸ Пауза":
                 handle_pause(chat_id, user_id)
             elif text == "📖 История":
-                handle_history(chat_id, user_id)
+                handle_history(chat_id, user_id)   # <-- ВЫЗОВ ИСПРАВЛЕН
             elif text == "▶️ Возобновить":
                 handle_resume(chat_id, user_id)
             elif text == "❓ Помощь":
