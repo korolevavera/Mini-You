@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date  # <-- добавлен date
 from flask import Flask, request
 import requests
 import psycopg2
@@ -62,6 +62,15 @@ def init_db():
                 user_id BIGINT PRIMARY KEY,
                 morning_time TEXT DEFAULT '06:30',
                 evening_time TEXT DEFAULT '23:00'
+            )
+        ''')
+        # НОВАЯ ТАБЛИЦА ДЛЯ ИСТОРИИ СООБЩЕНИЙ
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_messages (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT,
+                message TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         conn.commit()
@@ -299,7 +308,8 @@ def get_main_menu():
     keyboard = [
         [{"text": "📋 Сегодня"}, {"text": "📊 Статистика"}],
         [{"text": "🧘 Практики"}, {"text": "🎯 Стиль"}],
-        [{"text": "⏸ Пауза"}, {"text": "❓ Помощь"}],
+        [{"text": "📖 История"}, {"text": "⏸ Пауза"}],   # <-- добавлена кнопка История
+        [{"text": "❓ Помощь"}],
     ]
     return {'keyboard': keyboard, 'resize_keyboard': True}
 
@@ -319,8 +329,56 @@ def get_practice_keyboard(practices, user_id):
         keyboard.append([{"text": f"{status} {p['name']}", "callback_data": f"practice_view:{p['id']}"}])
     return {'inline_keyboard': keyboard}
 
+# ---------- НОВАЯ ФУНКЦИЯ ДЛЯ ИСТОРИИ ----------
+def handle_history(chat_id, user_id):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
+        rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
+        send_keyboard(chat_id, "Главное меню:", get_main_menu())
+        return
+
+    history_text = "📖 *Твоя полная история:*\n\n"
+    for row in rows:
+        date = row['timestamp'].strftime('%d.%m.%Y %H:%M')
+        history_text += f"*{date}*\n{row['message']}\n\n"
+        history_text += "—" * 30 + "\n\n"
+
+    if len(history_text) > 4000:
+        parts = []
+        current_part = ""
+        for row in rows:
+            date = row['timestamp'].strftime('%d.%m.%Y %H:%M')
+            block = f"*{date}*\n{row['message']}\n\n" + "—" * 30 + "\n\n"
+            if len(current_part) + len(block) > 4000:
+                parts.append(current_part)
+                current_part = block
+            else:
+                current_part += block
+        if current_part:
+            parts.append(current_part)
+
+        for i, part in enumerate(parts):
+            if i == 0:
+                send_message(chat_id, f"📖 *Твоя история (часть {i+1}/{len(parts)}):*\n\n{part}")
+            else:
+                send_message(chat_id, f"📖 *Продолжение (часть {i+1}/{len(parts)}):*\n\n{part}")
+    else:
+        send_message(chat_id, history_text)
+
+    send_keyboard(chat_id, "Главное меню:", get_main_menu())
+
 # ---------- ОБРАБОТЧИКИ ----------
 def handle_start(chat_id, user_id):
+    # СНИМАЕМ ПАУЗУ, ЕСЛИ ОНА БЫЛА
+    user = get_user(user_id)
+    if user and user.get('paused', False):
+        save_user_field(user_id, 'paused', False)
+    
     user = get_or_create_user(user_id)
     name = user.get('name', 'Армен')
     text = f"Привет, {name}!\n\nЯ — твое Второе Я. Я здесь, чтобы помочь тебе следить за ритмом.\n\nИспользуй кнопки ниже 👇"
@@ -526,12 +584,21 @@ def webhook():
                 handle_style(chat_id, user_id)
             elif text == "⏸ Пауза":
                 handle_pause(chat_id, user_id)
+            elif text == "📖 История":          # <-- НОВАЯ КНОПКА
+                handle_history(chat_id, user_id)
             elif text == "▶️ Возобновить":
                 handle_resume(chat_id, user_id)
             elif text == "❓ Помощь":
                 handle_help(chat_id)
             else:
-                # Сохраняем как отчёт
+                # СОХРАНЯЕМ СООБЩЕНИЕ В user_messages
+                conn = get_db_connection()
+                with conn.cursor() as cur:
+                    cur.execute("INSERT INTO user_messages (user_id, message) VALUES (%s, %s)", (user_id, text))
+                    conn.commit()
+                conn.close()
+                
+                # Сохраняем статистику
                 save_user_field(user_id, 'stats', {**user.get('stats', {}), 'reports': user.get('stats', {}).get('reports', 0) + 1})
                 send_message(chat_id, "📝 Сохранил твои мысли. Спасибо!")
                 send_keyboard(chat_id, "Главное меню:", get_main_menu())
