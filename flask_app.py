@@ -391,7 +391,7 @@ def handle_help(chat_id):
     text = "📖 Помощь\n\n📋 Сегодня — расписание\n📊 Статистика — твои данные\n🧘 Практики — список практик\n🎯 Стиль — карта архетипов\n⏸ Пауза — остановить\n▶️ Возобновить — продолжить"
     send_keyboard(chat_id, text, get_main_menu())
 
-# ---------- ОТДЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ИСТОРИИ (ИСПРАВЛЕНО) ----------
+# ---------- ИСТОРИЯ (исправленная) ----------
 def handle_history(chat_id, user_id):
     conn = get_db_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -402,7 +402,7 @@ def handle_history(chat_id, user_id):
     if not rows:
         send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
         send_keyboard(chat_id, "Главное меню:", get_main_menu())
-        return  # <-- ВАЖНО: возврат, чтобы не идти дальше
+        return
 
     history_text = "📖 *Твоя полная история:*\n\n"
     for row in rows:
@@ -579,7 +579,7 @@ def webhook():
             elif text == "⏸ Пауза":
                 handle_pause(chat_id, user_id)
             elif text == "📖 История":
-                handle_history(chat_id, user_id)   # <-- ВЫЗОВ ИСПРАВЛЕН
+                handle_history(chat_id, user_id)
             elif text == "▶️ Возобновить":
                 handle_resume(chat_id, user_id)
             elif text == "❓ Помощь":
@@ -591,7 +591,7 @@ def webhook():
                     cur.execute("INSERT INTO user_messages (user_id, message) VALUES (%s, %s)", (user_id, text))
                     conn.commit()
                 conn.close()
-                
+
                 # Сохраняем статистику
                 save_user_field(user_id, 'stats', {**user.get('stats', {}), 'reports': user.get('stats', {}).get('reports', 0) + 1})
                 send_message(chat_id, "📝 Сохранил твои мысли. Спасибо!")
