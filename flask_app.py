@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from flask import Flask, request
 import requests
 import psycopg2
@@ -429,7 +429,7 @@ def get_practice_keyboard(practices, user_id):
         keyboard.append([{"text": f"{status} {p['name']}", "callback_data": f"practice_view:{p['id']}"}])
     return {'inline_keyboard': buttons}
 
-# ---------- ИСТОРИЯ (НОВАЯ ФУНКЦИЯ) ----------
+# ---------- ИСТОРИЯ ----------
 def handle_history(chat_id, user_id):
     conn = get_db_connection()
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -474,6 +474,11 @@ def handle_history(chat_id, user_id):
 
 # ---------- ОБРАБОТЧИКИ ----------
 def handle_start(chat_id, user_id):
+    # Снимаем паузу, если она была
+    user = get_user(user_id)
+    if user and user.get('paused', False):
+        save_user_field(user_id, 'paused', False)
+    
     user = get_or_create_user(user_id)
     name = user.get('name', 'Армен')
     text = f"Привет, {name}!\n\nЯ — твое Второе Я. Я здесь, чтобы помочь тебе следить за ритмом.\n\nИспользуй кнопки ниже 👇"
