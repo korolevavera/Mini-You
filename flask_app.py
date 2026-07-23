@@ -823,8 +823,6 @@ def webhook():
         logging.info(f"Получен запрос: {data}")
 
         if 'callback_query' in data:
-            # Здесь будет обработка callback'ов (практики, глубокий тест, карта архетипов)
-            # Для полноты функционала нужно добавить, но пока оставим заглушку
             return 'ok', 200
 
         if 'message' in data:
@@ -844,24 +842,28 @@ def webhook():
                 send_message(chat_id, "⏸ Бот на паузе. Чтобы возобновить, нажми ▶️ Возобновить.")
                 return 'ok', 200
 
-            # Команды
+            # ========== ИСПРАВЛЕННЫЙ БЛОК КОМАНД ==========
             if text.startswith('/'):
-                if text == '/start':
+                # Очищаем команду: убираем пробелы и упоминание бота
+                command = text.strip().split()[0].split('@')[0]
+                
+                if command == '/start':
                     if user.get('paused', 0):
                         save_user_field(user_id, 'paused', 0)
                     name = user.get('character_name', 'Мини-Я')
                     welcome = f"👋 Привет, {escape_markdown(name)}!\n\nЯ — твой Мини-Ты. Я здесь, чтобы помочь тебе лучше понять себя.\nВыбирай, с чего начнём 👇"
                     show_main_menu(chat_id, welcome)
-                elif text == '/test':
+                elif command == '/test':
                     start_test(chat_id, user_id)
-                elif text == '/archetype':
+                elif command == '/archetype':
                     show_archetype(chat_id, user_id)
-                elif text == '/reset_me':
+                elif command == '/reset_me':
                     delete_user(user_id)
                     send_message(chat_id, "🔄 Аккаунт сброшен. Напиши /start для начала.")
                 else:
                     show_main_menu(chat_id, "Главное меню:")
                 return 'ok', 200
+            # ==============================================
 
             # Кнопки меню
             if text == "🏠 Главная":
@@ -914,7 +916,6 @@ def webhook():
                 return 'ok', 200
 
             if text == "📊 Прогресс":
-                # Показываем прогресс (упрощённо)
                 phrases = json.loads(user.get('key_phrases', '[]'))
                 arch = user.get('archetype')
                 arch_name = get_archetype_name(arch) if arch else 'не определён'
