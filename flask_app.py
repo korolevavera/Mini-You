@@ -64,7 +64,7 @@ def init_db():
                 evening_time TEXT DEFAULT '23:00'
             )
         ''')
-                cur.execute('''
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS user_messages (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT,
@@ -329,6 +329,16 @@ def get_practice_keyboard(practices, user_id):
     return {'inline_keyboard': keyboard}
 
 # ---------- ОБРАБОТЧИКИ ----------
+def handle_history(chat_id, user_id):
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
+        rows = cur.fetchall()
+    conn.close()
+
+    if not rows:
+        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
+        send_keyboard(chat_id, "Главное меню:", get_main_menu())
 def handle_start(chat_id, user_id):
     user = get_or_create_user(user_id)
     name = user.get('name', 'Армен')
@@ -390,17 +400,8 @@ def handle_resume(chat_id, user_id):
 def handle_help(chat_id):
     text = "📖 Помощь\n\n📋 Сегодня — расписание\n📊 Статистика — твои данные\n🧘 Практики — список практик\n🎯 Стиль — карта архетипов\n⏸ Пауза — остановить\n▶️ Возобновить — продолжить"
     send_keyboard(chat_id, text, get_main_menu())
-    def handle_history(chat_id, user_id):
-    conn = get_db_connection()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT message, timestamp FROM user_messages WHERE user_id = %s ORDER BY timestamp DESC LIMIT 50", (user_id,))
-        rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        send_message(chat_id, "📖 История пуста. Напиши что-нибудь, и я сохраню.")
-        send_keyboard(chat_id, "Главное меню:", get_main_menu())
-        return
+    
+    return
 
     history_text = "📖 *Твоя полная история:*\n\n"
     for row in rows:
@@ -576,7 +577,7 @@ def webhook():
                 handle_style(chat_id, user_id)
             elif text == "⏸ Пауза":
                 handle_pause(chat_id, user_id)
-                            elif text == "📖 История":
+            elif text == "📖 История":
                 handle_history(chat_id, user_id)
             elif text == "▶️ Возобновить":
                 handle_resume(chat_id, user_id)
